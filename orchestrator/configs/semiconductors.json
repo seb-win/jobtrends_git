@@ -1,0 +1,40 @@
+[{
+    "name": "infineon_scraper",
+    "path": "scrapers/semiconductors/infineon.py"
+}, {
+    "name": "analog_devices_scraper",
+    "path": "scrapers/semiconductors/adi.py"
+}, {
+    "name": "amd_scraper",
+    "path": "scrapers/semiconductors/amd_v2.py"
+}, {
+    "name": "applied_materials_scraper",
+    "path": "scrapers/semiconductors/applied.py"
+}, {
+    "name": "arm_scraper",
+    "path": "scrapers/semiconductors/arm.py"
+}, {
+    "name": "asml_scraper",
+    "path": "scrapers/semiconductors/asml.py"
+}, {
+    "name": "broadcom_scraper",
+    "path": "scrapers/semiconductors/broadcom.py"
+}, {
+    "name": "intel_scraper",
+    "path": "scrapers/semiconductors/intel_v2.py"
+}, {
+    "name": "lam_scraper",
+    "path": "scrapers/semiconductors/lam.py"
+}, {
+    "name": "marvell_scraper",
+    "path": "scrapers/semiconductors/marvell.py"
+}, {
+    "name": "micron_scraper",
+    "path": "scrapers/semiconductors/micron.py"
+}, {
+    "name": "texas_instruments_scraper",
+    "path": "scrapers/semiconductors/ti.py"
+}, {
+    "name": "tsmc_scraper",
+    "path": "scrapers/semiconductors/tsmc.py"
+}]

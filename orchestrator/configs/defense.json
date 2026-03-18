@@ -1,0 +1,52 @@
+[{
+    "name": "anduril_scraper",
+    "path": "scrapers/defense/anduril.py"
+}, {
+    "name": "epirus_scraper",
+    "path": "scrapers/defense/epirus.py"
+}, {
+    "name": "chaos_scraper",
+    "path": "scrapers/defense/chaos.py"
+}, {
+    "name": "lockheed_scraper",
+    "path": "scrapers/defense/lockheed.py"
+}, {
+    "name": "palantir_scraper",
+    "path": "scrapers/defense/palantir.py"
+}, {
+    "name": "rtx_scraper",
+    "path": "scrapers/defense/rtx.py"
+}, {
+    "name": "general_dynamics_scraper",
+    "path": "scrapers/defense/general_dynamics.py"
+}, {
+    "name": "helsing_scraper",
+    "path": "scrapers/defense/helsing.py"
+}, {
+    "name": "northrop_scraper",
+    "path": "scrapers/defense/northrop.py"
+}, {
+    "name": "rheinmetall_scraper",
+    "path": "scrapers/defense/rheinmetall.py"
+}, {
+    "name": "knds_scraper",
+    "path": "scrapers/defense/knds.py"
+}, {
+    "name": "shield_ai_scraper",
+    "path": "scrapers/defense/shield_ai.py"
+}, {
+    "name": "hensoldt_scraper",
+    "path": "scrapers/defense/hensoldt.py"
+}, {
+    "name": "mbda_scraper",
+    "path": "scrapers/defense/mbda.py"
+}, {
+    "name": "renk_scraper",
+    "path": "scrapers/defense/renk.py"
+}, {
+    "name": "l3harris_scraper",
+    "path": "scrapers/defense/l3harris.py"
+}, {
+    "name": "leonardo_scraper",
+    "path": "scrapers/defense/leonardo.py"
+}]

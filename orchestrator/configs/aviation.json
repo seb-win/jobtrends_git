@@ -1,0 +1,13 @@
+[{
+    "name": "airbus_scraper",
+    "path": "scrapers/aviation/airbus.py"
+}, {
+    "name": "boeing_scraper",
+    "path": "scrapers/aviation/boeing.py"
+}, {
+    "name": "rolls_royce_scraper",
+    "path": "scrapers/aviation/rolls_royce.py"
+}, {
+    "name": "mtu_areo_engines_scraper",
+    "path": "scrapers/aviation/mtu.py"
+}]

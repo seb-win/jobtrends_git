@@ -1,0 +1,31 @@
+[{
+    "name": "alixpartners_scraper",
+    "path": "scrapers/consulting/alix.py"
+}, {
+    "name": "deloitte_us_scraper",
+    "path": "scrapers/consulting/deloitte_us.py"
+}, {
+    "name": "kearney_scraper",
+    "path": "scrapers/consulting/kearney.py"
+}, {
+    "name": "bain_scraper",
+    "path": "scrapers/consulting/bain.py"
+}, {
+    "name": "bcg_scraper",
+    "path": "scrapers/consulting/bcg.py"
+}, {
+    "name": "deloitte_de_scraper",
+    "path": "scrapers/consulting/deloitte.py"
+}, {
+    "name": "mckinsey_scraper",
+    "path": "scrapers/consulting/mckinsey_v2.py"
+}, {
+    "name": "oliver_wyman_scraper",
+    "path": "scrapers/consulting/oliver_wyman.py"
+}, {
+    "name": "roland_berger_scraper",
+    "path": "scrapers/consulting/roland_berger.py"
+}, {
+    "name": "strategy_and_scraper",
+    "path": "scrapers/consulting/strategy_and.py"
+}]

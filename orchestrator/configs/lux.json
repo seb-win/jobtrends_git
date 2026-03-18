@@ -1,0 +1,14 @@
+
+[{
+    "name": "kering_scraper",
+    "path": "scrapers/lux/kering.py"
+}, {
+    "name": "lvmh_scraper",
+    "path": "scrapers/lux/lvmh.py"
+}, {
+    "name": "hermès_scraper",
+    "path": "scrapers/lux/hermes.py"
+}, {
+    "name": "richemont_scraper",
+    "path": "scrapers/lux/richemont.py"
+}]

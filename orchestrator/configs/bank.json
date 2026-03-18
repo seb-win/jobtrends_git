@@ -1,0 +1,25 @@
+[{
+    "name": "citi_scraper",
+    "path": "scrapers/banking/citi.py"
+}, {
+    "name": "charles_schwab_scraper",
+    "path": "scrapers/banking/charles_schwab.py"
+}, {
+    "name": "bank_of_america_scraper",
+    "path": "scrapers/banking/boa.py"
+}, {
+    "name": "deutsche_bank_scraper",
+    "path": "scrapers/banking/deutschebank.py"
+}, {
+    "name": "goldman_sachs_scraper",
+    "path": "scrapers/banking/goldman.py"
+}, {
+    "name": "jp_morgan_scraper",
+    "path": "scrapers/banking/jpmorgan.py"
+}, {
+    "name": "morgan_stanley_scraper",
+    "path": "scrapers/banking/morganstanley.py"
+}, {
+    "name": "wells_fargo_scraper",
+    "path": "scrapers/banking/wellsfargo.py"
+}]

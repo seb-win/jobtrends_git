@@ -1,0 +1,55 @@
+[{
+    "name": "ford_prof_us_scraper",
+    "path": "scrapers/auto/ford_prof_us.py"
+}, {
+    "name": "ford_prof_nonus_scraper",
+    "path": "scrapers/auto/ford_prof_nonus.py"
+}, {
+    "name": "ford_global_nonprof_scraper",
+    "path": "scrapers/auto/ford_global_nonprof.py"
+}, {
+    "name": "stellantis_scraper",
+    "path": "scrapers/auto/stellantis.py"
+}, {
+    "name": "gm_scraper",
+    "path": "scrapers/auto/gm.py"
+}, {
+    "name": "renault_scraper",
+    "path": "scrapers/auto/renault.py"
+}, {
+    "name": "audi_scraper",
+    "path": "scrapers/auto/audi_v2.py"
+}, {
+    "name": "bmw_scraper",
+    "path": "scrapers/auto/bmw_v2.py"
+}, {
+    "name": "mercedes_scraper",
+    "path": "scrapers/auto/mercedes.py"
+}, {
+    "name": "porsche_scraper",
+    "path": "scrapers/auto/porsche.py"
+}, {
+    "name": "rivian_scraper",
+    "path": "scrapers/auto/rivian.py"
+}, {
+    "name": "rivian_vw_scraper",
+    "path": "scrapers/auto/rivian_vw.py"
+}, {
+    "name": "vw_scraper",
+    "path": "scrapers/auto/vw.py"
+}, {
+    "name": "lucid_scraper",
+    "path": "scrapers/auto/lucid.py"
+}, {
+    "name": "volvo_scraper",
+    "path": "scrapers/auto/volvo.py"
+}, {
+    "name": "man_scraper",
+    "path": "scrapers/auto/man.py"
+}, {
+    "name": "daimler_truck_scraper",
+    "path": "scrapers/auto/daimler_truck.py"
+}, {
+    "name": "cariad_scraper",
+    "path": "scrapers/auto/cariad.py"
+}]

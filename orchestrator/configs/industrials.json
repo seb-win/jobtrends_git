@@ -1,0 +1,19 @@
+[{
+    "name": "siemens_scraper",
+    "path": "scrapers/industrials/siemens.py"
+}, {
+    "name": "ge_healthcare_scraper",
+    "path": "scrapers/industrials/ge_healthcare.py"
+}, {
+    "name": "ge_vernova_scraper",
+    "path": "scrapers/industrials/ge_vernova.py"
+}, {
+    "name": "ge_aerospace_scraper",
+    "path": "scrapers/industrials/ge_aerospace.py"
+}, {
+    "name": "schneider_electric_scraper",
+    "path": "scrapers/industrials/schneider_electric.py"
+}, {
+    "name": "abb_scraper",
+    "path": "scrapers/industrials/abb.py"
+}]
