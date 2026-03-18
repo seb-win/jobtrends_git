@@ -1,0 +1,8 @@
+{
+  "max_retries": 2,
+  "timeout": 300,
+  "logging": {
+    "level": "info",
+    "file": "logs/{script_name}.log"
+  }
+}

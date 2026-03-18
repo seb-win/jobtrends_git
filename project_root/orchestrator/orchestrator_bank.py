@@ -11,7 +11,7 @@ CONFIG_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "configs/"
 
 # Construct full paths for the JSON files
 scripts_json_path = os.path.join(CONFIG_PATH, "bank.json")
-orchestrator_json_path = os.path.join(CONFIG_PATH, "orchestrator_bank.json")
+orchestrator_json_path = os.path.join(CONFIG_PATH, "orchestrator.json")
 
 # Verify that the files exist
 if not os.path.exists(scripts_json_path):
