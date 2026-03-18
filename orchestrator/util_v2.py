@@ -8,6 +8,7 @@ import json
 import html as html_lib
 import re
 from functools import lru_cache
+from pathlib import Path
 from bs4 import BeautifulSoup
 from datetime import datetime
 from google.cloud import storage
@@ -25,7 +26,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # Fixed proxy credentials and GCS path
 PROXY_USERNAME = 'swerch_DqgN3'
 PROXY_PASSWORD = 'oxy_M0d3na4ever'
-CREDENTIALS_PATH = "/Users/sebastianwinkler/Documents/Jobseite/AI/work_for_elon/service_account_key.json"
+BASE_DIR = Path(__file__).resolve().parent
+CREDENTIALS_PATH = str(BASE_DIR / "configs" / "service_account_key.json")
 country_code = 'US'
 GCS_TIMEOUT = (20, 300)
 GCS_RETRY_DEADLINE = 600
@@ -285,5 +287,4 @@ def clean_html_block(block_html: str) -> str:
     text = fix_encoding(text)
     
     return text
-
 

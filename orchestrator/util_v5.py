@@ -5,6 +5,7 @@ import time
 import subprocess
 import logging
 from datetime import datetime
+from pathlib import Path
 from google.cloud import storage
 
 ######
@@ -19,7 +20,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # Fixed proxy credentials and GCS path
 PROXY_USERNAME = 'swerch_DqgN3'
 PROXY_PASSWORD = 'oxy_M0d3na4ever'
-CREDENTIALS_PATH = "/Users/sebastianwinkler/Documents/Jobseite/AI/work_for_elon/service_account_key.json"
+BASE_DIR = Path(__file__).resolve().parent
+CREDENTIALS_PATH = str(BASE_DIR / "configs" / "service_account_key.json")
 country_code = 'US'
 
 
