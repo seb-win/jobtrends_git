@@ -1,0 +1,17 @@
+
+[{
+    "name": "1x_tech_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/robotics/1x_tech.py"
+}, {
+    "name": "figure_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/robotics/figure.py"
+}, {
+    "name": "nimble_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/robotics/nimble.py"
+}, {
+    "name": "sanctuary_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/robotics/sanctuary.py"
+}, {
+    "name": "boston_dynamics_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/robotics/boston_dynamics.py"
+}]

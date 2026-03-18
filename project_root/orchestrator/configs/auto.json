@@ -1,0 +1,55 @@
+[{
+    "name": "ford_prof_us_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/auto/ford_prof_us.py"
+}, {
+    "name": "ford_prof_nonus_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/auto/ford_prof_nonus.py"
+}, {
+    "name": "ford_global_nonprof_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/auto/ford_global_nonprof.py"
+}, {
+    "name": "stellantis_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/auto/stellantis.py"
+}, {
+    "name": "gm_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/auto/gm.py"
+}, {
+    "name": "renault_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/auto/renault.py"
+}, {
+    "name": "audi_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/auto/audi_v2.py"
+}, {
+    "name": "bmw_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/auto/bmw_v2.py"
+}, {
+    "name": "mercedes_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/auto/mercedes.py"
+}, {
+    "name": "porsche_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/auto/porsche.py"
+}, {
+    "name": "rivian_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/auto/rivian.py"
+}, {
+    "name": "rivian_vw_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/auto/rivian_vw.py"
+}, {
+    "name": "vw_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/auto/vw.py"
+}, {
+    "name": "lucid_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/auto/lucid.py"
+}, {
+    "name": "volvo_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/auto/volvo.py"
+}, {
+    "name": "man_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/auto/man.py"
+}, {
+    "name": "daimler_truck_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/auto/daimler_truck.py"
+}, {
+    "name": "cariad_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/auto/cariad.py"
+}]

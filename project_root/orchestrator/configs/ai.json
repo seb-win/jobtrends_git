@@ -1,0 +1,25 @@
+[{
+    "name": "openai_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/ai/openai.py"
+}, {
+    "name": "anthropic_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/ai/anthropic.py"
+}, {
+    "name": "perplexity_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/ai/perplexity_v2.py"
+}, {
+    "name": "mistral_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/ai/mistral.py"
+}, {
+    "name": "cohere_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/ai/cohere.py"
+}, {
+    "name": "applied_intuition_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/ai/applied_intuition.py"
+}, {
+    "name": "runway_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/ai/runway.py"
+}, {
+    "name": "xai_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/ai/xai.py"
+}]

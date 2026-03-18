@@ -1,0 +1,25 @@
+[{
+    "name": "citi_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/banking/citi.py"
+}, {
+    "name": "charles_schwab_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/banking/charles_schwab.py"
+}, {
+    "name": "bank_of_america_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/banking/bank_of_america.py"
+}, {
+    "name": "deutsche_bank_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/banking/deutsche_bank.py"
+}, {
+    "name": "goldman_sachs_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/banking/goldman_sachs.py"
+}, {
+    "name": "jp_morgan_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/banking/jp_morgan.py"
+}, {
+    "name": "morgan_stanley_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/banking/morgan_stanley.py"
+}, {
+    "name": "wells_fargo_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/banking/wells_fargo.py"
+}]

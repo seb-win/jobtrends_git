@@ -1,0 +1,52 @@
+[{
+    "name": "anduril_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/defense/anduril.py"
+}, {
+    "name": "epirus_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/defense/epirus.py"
+}, {
+    "name": "chaos_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/defense/chaos.py"
+}, {
+    "name": "lockheed_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/defense/lockheed.py"
+}, {
+    "name": "palantir_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/defense/palantir.py"
+}, {
+    "name": "rtx_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/defense/rtx.py"
+}, {
+    "name": "general_dynamics_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/defense/general_dynamics.py"
+}, {
+    "name": "helsing_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/defense/helsing.py"
+}, {
+    "name": "northrop_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/defense/northrop.py"
+}, {
+    "name": "rheinmetall_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/defense/rheinmetall.py"
+}, {
+    "name": "knds_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/defense/knds.py"
+}, {
+    "name": "shield_ai_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/defense/shield_ai.py"
+}, {
+    "name": "hensoldt_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/defense/hensoldt.py"
+}, {
+    "name": "mbda_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/defense/mbda.py"
+}, {
+    "name": "renk_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/defense/renk.py"
+}, {
+    "name": "l3harris_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/defense/l3harris.py"
+}, {
+    "name": "leonardo_scraper",
+    "path": "/home/sebwinkler84/project_root/scrapers/defense/leonardo.py"
+}]
