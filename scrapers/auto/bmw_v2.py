@@ -30,8 +30,8 @@ _bootstrap_import_paths()
 
 try:
     from orchestrator.extractors.bmw_detail_extractor import extract_detail_sections
-    from orchestrator.schemas.DBNormalize import _now_utc_iso, _prepare_job_for_db
-    from orchestrator.schemas.db_runs import (
+    from orchestrator.DBNormalize import _now_utc_iso, _prepare_job_for_db
+    from orchestrator.db_runs import (
         finish_run,
         get_conn,
         mark_jobs_inactive,
@@ -40,9 +40,9 @@ try:
         update_stage,
         upsert_job_and_payload_from_master,
     )
-    from orchestrator.schemas.detailjob.builder import build_detailjob
-    from orchestrator.schemas.RunMetrics import _update_http_columns_in_db
-    from orchestrator.schemas.util_v5 import (
+    from orchestrator.schemas.builder import build_detailjob
+    from orchestrator.RunMetrics import _update_http_columns_in_db
+    from orchestrator.util_v5 import (
         fetch_url,
         get_current_date,
         load_master_list,
@@ -53,8 +53,8 @@ try:
 except ImportError:
     # Fallback for running directly inside the VM's orchestrator folder.
     from extractors.bmw_detail_extractor import extract_detail_sections
-    from schemas.DBNormalize import _now_utc_iso, _prepare_job_for_db
-    from schemas.db_runs import (
+    from DBNormalize import _now_utc_iso, _prepare_job_for_db
+    from db_runs import (
         finish_run,
         get_conn,
         mark_jobs_inactive,
@@ -63,9 +63,9 @@ except ImportError:
         update_stage,
         upsert_job_and_payload_from_master,
     )
-    from schemas.detailjob.builder import build_detailjob
-    from schemas.RunMetrics import _update_http_columns_in_db
-    from schemas.util_v5 import (
+    from schemas.builder import build_detailjob
+    from RunMetrics import _update_http_columns_in_db
+    from util_v5 import (
         fetch_url,
         get_current_date,
         load_master_list,
