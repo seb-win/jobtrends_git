@@ -193,7 +193,7 @@ def main():
     # Summary Log
     logging.info(f"Scraping completed successfully. {len(jobs)} jobs processed. {new_jobs_count} new jobs added. {inactive_jobs_count} jobs marked as inactive.")
     logging.info(f"Total jobs skipped due to missing IDs: {skipped_jobs_count}")
-    send_metrics_to_cloud_function(execution_time, cpu_usage, len(jobs), new_jobs_count, inactive_jobs_count, skipped_jobs_count)
+    send_metrics_to_cloud_function(FOLDER_NAME, execution_time, cpu_usage, len(jobs), new_jobs_count, inactive_jobs_count, skipped_jobs_count)
 
 def process_jobs(job_data, job_data_keys):
     """Extract relevant job details from job data (customize per site)."""

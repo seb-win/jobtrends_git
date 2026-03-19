@@ -4,6 +4,7 @@ import psutil
 from bs4 import BeautifulSoup
 from datetime import datetime
 import time
+import json
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -14,7 +15,7 @@ from orchestrator.util_v2 import (
 # Configuration and Constants
 # --------------------------------------
 BUCKET_NAME = 'pharma_jobs'
-FOLDER_NAME = 'bsm'
+FOLDER_NAME = 'bms'
 
 USE_PROXY_DAILY_LIST = True
 USE_PROXY_DETAILED_POSTINGS = True
@@ -32,37 +33,37 @@ PAGE_START = 0
 PAGINATION_MODE = 'offset'
 
 KEY_NAME = 'limit'
-JOBS_LIST_KEY = ['positions']
-TOTAL_JOBS_KEY = ['count']
+JOBS_LIST_KEY = ['data', 'positions']
+TOTAL_JOBS_KEY = ['data', 'count']
 
 HEADERS = {
-    'accept': '*/*',
+    'accept': 'application/json, text/plain, */*',
     'accept-language': 'de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7',
-    'cache-control': 'max-age=0',
-    'content-type': 'application/json',
     'priority': 'u=1, i',
-    'referer': 'https://jobs.bms.com/careers',
-    'sec-ch-ua': '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
+    'referer': 'https://jobs.bms.com/careers?domain=bms.com&start=0&pid=137479721246&sort_by=timestamp',
+    'sec-ch-ua': '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"macOS"',
     'sec-fetch-dest': 'empty',
     'sec-fetch-mode': 'cors',
     'sec-fetch-site': 'same-origin',
-    'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+    'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
+    #'x-browser-request-time': '1773430085.982',
+    #'x-csrf-token': 'IjMxN2M2OWYyM2I0NGQyMjhkZDY2YWQwYjcxMzVhYWUyZTU1MWRlY2Qi.HJX2xQ.WZudBfaQ1c-2ARUAn1WLNWHm9S8',
 }
 
-DAILY_JOB_URL = 'https://jobs.bms.com/api/apply/v2/jobs'
+DAILY_JOB_URL = 'https://jobs.bms.com/api/pcsx/search?domain=bms.com&query=&location=&start=0&sort_by=timestamp&'
 
 JOB_DATA_KEYS = {
-    'created': ['t_create'],
+    'created': ['creationTs'],
     'jobTitle': ['name'],
     'department': ['department'],
     'team': ['business_unit'],
-    'location': ['location'],
+    'location': ['locations', 0],
     'country': [],
     'contract': [],
     'id': ['id'],
-    'link': ['canonicalPositionUrl'],
+    'link': ['positionUrl'],
     'career_level': [],
     'employment_type': [],
     'description': ['job_description']
@@ -72,13 +73,7 @@ extraction_logic = {
     # If any specific fields need special handling, define them here.
 }
 
-PARAMS = [
-    ('domain', 'bms.com'),
-    ('start', '0'),
-    ('num', '10'),
-    ('domain', 'bms.com'),
-    ('sort_by', 'relevance'),
-]
+PARAMS = None
 JSON_PAYLOAD = None
 DATA = None
 
@@ -126,9 +121,10 @@ def fetch_job_list_page(page):
     """
 
     offset = (page * MAX_JOBS_PER_PAGE)
-    params = dict(PARAMS)  # Converts list to dictionary (removes duplicates)
+    params = dict(PARAMS or {})  # Converts list to dictionary (removes duplicates)
     params['start'] = offset  # Modify start
     params = list(params.items())  # Convert back to list
+    DAILY_JOB_URL = f'https://jobs.bms.com/api/pcsx/search?domain=bms.com&query=&location=&start={offset}&sort_by=timestamp&'
 
     response = fetch_url(
         DAILY_JOB_URL,
@@ -236,24 +232,43 @@ def update_master_list_with_jobs(jobs, master_list):
             master_list.append(job)
             new_jobs_count += 1
 
-            # Fetch job details if a link is provided
-            # job_link = job.get('link')
-            # if job_link:
-            #     response = fetch_url(
-            #         job_link,
-            #         headers=HEADERS,
-            #         params=PARAMS,
-            #         json=JSON_PAYLOAD,
-            #         data=DATA,
-            #         use_proxy=USE_PROXY_DETAILED_POSTINGS,
-            #         max_retries=3,
-            #         timeout=10,
-            #         request_type=REQUEST_TYPE_SINGLE
-            #     )
-            #     if response:
-            #         soup = BeautifulSoup(response.text, 'html.parser')
-            #         job_text = soup.get_text()
-            #         upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
+            #Fetch job details if a link is provided
+            job_link = 'https://jobs.bms.com/api/pcsx/position_details' 
+            params = {
+                'position_id': job.get('id'),
+                'domain': 'bms.com',
+                'hl': 'de',
+            }
+            if job_link:
+                response = fetch_url(
+                    job_link,
+                    headers=HEADERS,
+                    params=params,
+                    json=JSON_PAYLOAD,
+                    data=DATA,
+                    use_proxy=USE_PROXY_DETAILED_POSTINGS,
+                    max_retries=3,
+                    timeout=10,
+                    request_type=REQUEST_TYPE_SINGLE
+                )
+                if response:
+                    job_json = json.loads(response.text)
+                    job_data = job_json['data']
+
+                    excluded_keys = {
+                        "positionExtraDetails",
+                        "positionUserActions",
+                        "standardizedLocations"
+                    }
+
+                    job_text = {
+                        key: value
+                        for key, value in job_data.items()
+                        if key not in excluded_keys
+                    }
+
+                    job_text = json.dumps(job_text, ensure_ascii=False)
+                    upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
 
     # Mark old jobs as inactive
     for entry in master_list:

@@ -136,13 +136,14 @@ def fetch_all_jobs():
     Otherwise, fetch only a single page.
     """
     all_jobs = []
+    query_params = params.copy()
 
     if USE_PAGINATION:
         page = PAGE_START
         while True:
             logging.info(f"Fetching page {page} of job listings...")
-            params['startRow'] = page * MAX_JOBS_PER_PAGE
-            job_postings = fetch_job_list_page(DAILY_JOB_URL, HEADERS, params, use_proxy=USE_PROXY_DAILY_LIST)
+            query_params['startrow'] = page * MAX_JOBS_PER_PAGE
+            job_postings = fetch_job_list_page(DAILY_JOB_URL, HEADERS, query_params, use_proxy=USE_PROXY_DAILY_LIST)
             if not job_postings:
                 logging.info("No more job postings found, or failed to retrieve job postings.")
                 break
@@ -157,8 +158,8 @@ def fetch_all_jobs():
             page += 1
     else:
         logging.info("Fetching a single page of job listings...")
-        params = {'limit': MAX_JOBS_PER_PAGE}
-        job_postings = fetch_job_list_page(DAILY_JOB_URL, HEADERS, params, use_proxy=USE_PROXY_DAILY_LIST)
+        query_params['startrow'] = 0
+        job_postings = fetch_job_list_page(DAILY_JOB_URL, HEADERS, query_params, use_proxy=USE_PROXY_DAILY_LIST)
         if job_postings:
             jobs = process_jobs(job_postings)
             all_jobs.extend(jobs)

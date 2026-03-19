@@ -2,7 +2,7 @@ import logging
 import time
 import psutil
 from bs4 import BeautifulSoup
-import sys
+import json
 
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
