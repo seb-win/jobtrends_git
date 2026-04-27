@@ -2,6 +2,9 @@ import logging
 import time
 import psutil
 from bs4 import BeautifulSoup
+import json
+import html
+
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -30,38 +33,35 @@ PAGE_START = 0
 PAGINATION_MODE = 'page'
 
 KEY_NAME = 'limit'
-JOBS_LIST_KEY = ['positions']
-TOTAL_JOBS_KEY = ['count']
+JOBS_LIST_KEY = ['data', 'positions']
+TOTAL_JOBS_KEY = ['data', 'count']
 
 HEADERS = {
-    'accept': '*/*',
+    'accept': 'application/json, text/plain, */*',
     'accept-language': 'de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7',
-    'cache-control': 'max-age=0',
-    'content-type': 'application/json',
     'priority': 'u=1, i',
     'referer': 'https://morganstanley.eightfold.ai/careers?source=mscom',
-    'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    'sec-ch-ua': '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"macOS"',
     'sec-fetch-dest': 'empty',
     'sec-fetch-mode': 'cors',
     'sec-fetch-site': 'same-origin',
-    'sentry-trace': '9bdbfe606a084cc1b617f65158d523c8-b4762dc59d2fc02c-0',
-    'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
 }
 
-DAILY_JOB_URL = 'https://morganstanley.eightfold.ai/api/apply/v2/jobs'
+DAILY_JOB_URL = 'https://morganstanley.eightfold.ai/api/pcsx/search'
 
 JOB_DATA_KEYS = {
-    'created': ['t_create'],
+    'created': ['creationTs'],
     'jobTitle': ['name'],
     'department': ['department'],
     'team': [],
-    'location': ['location'],
+    'location': ['locations', 0],
     'country': [],
     'contract': [],
     'id': ['id'],
-    'link': ['canonicalPositionUrl'],
+    'link': ['positionUrl'],
     'career_level': [],
     'employment_type': [],
 }
@@ -70,13 +70,15 @@ extraction_logic = {
     # If any specific fields need special handling, define them here.
 }
 
-PARAMS = [
-    ('domain', 'morganstanley.com'),
-    ('start', '0'),
-    ('num', '10'),
-    ('domain', 'morganstanley.com'),
-    ('sort_by', 'relevance'),
-]
+PARAMS = {
+    'domain': 'morganstanley.com',
+    'query': '',
+    'location': '',
+    'start': '0',
+    'sort_by': 'timestamp',
+    'filter_country': 'United States of America',
+}
+
 JSON_PAYLOAD = None
 DATA = None
 
@@ -230,12 +232,17 @@ def update_master_list_with_jobs(jobs, master_list):
             new_jobs_count += 1
 
             # Fetch job details if a link is provided
-            job_link = 'https://morganstanley.eightfold.ai/api/apply/v2/jobs/' + str(job['id'])
+            job_link = 'https://morganstanley.eightfold.ai/api/pcsx/position_details' 
+            params = {
+                'position_id': job_id,
+                'domain': 'morganstanley.com',
+                'hl': 'en',
+            }
             if job_link:
                 response = fetch_url(
                     job_link,
                     headers=HEADERS,
-                    params=PARAMS,
+                    params=params,
                     json=JSON_PAYLOAD,
                     data=DATA,
                     use_proxy=USE_PROXY_DETAILED_POSTINGS,
@@ -244,9 +251,37 @@ def update_master_list_with_jobs(jobs, master_list):
                     request_type=REQUEST_TYPE_SINGLE
                 )
                 if response:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    job_text = soup.get_text()
-                    upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
+                    job_text = json.loads(response.text)
+
+                    data = job_text.get("data")
+                    raw_description = data.get("jobDescription", "")
+                    if raw_description:
+                        cleaned_description = raw_description.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+                        cleaned_description = cleaned_description.replace("</li>", "\n").replace("<li>", "- ")
+                        cleaned_description = BeautifulSoup(cleaned_description, "html.parser").get_text()
+                        cleaned_description = html.unescape(cleaned_description)
+
+                        cleaned_description = "\n".join(line.strip() for line in cleaned_description.splitlines())
+                        cleaned_description = "\n\n".join(
+                            block for block in cleaned_description.split("\n\n") if block.strip()
+                        )
+                    else:
+                        cleaned_description = ""
+
+
+                    new_json = {
+                        "CreationTS": data.get("creationTs"),
+                        "Department": data.get("department"),
+                        "ID": data.get("id"),
+                        "JobDescription": cleaned_description,
+                        "Location": data.get("location") or (
+                            data.get("locations")[0] if data.get("locations") else None
+                        ),
+                        "Name": data.get("name")
+                    }
+
+                    new_json_str = json.dumps(new_json, ensure_ascii=False)
+                    upload_job_details_to_gcs(new_json_str, job_id, BUCKET_NAME, FOLDER_NAME)
 
     # Mark old jobs as inactive
     for entry in master_list:

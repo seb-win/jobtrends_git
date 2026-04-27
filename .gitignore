@@ -3,3 +3,4 @@ orchestrator/configs/service_account_key.json
 .DS_Store
 __pycache__/
 *.pyc
+orchestrator/logs/

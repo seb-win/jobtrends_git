@@ -2,6 +2,10 @@ import logging
 import time
 import psutil
 from bs4 import BeautifulSoup
+from datetime import datetime, timezone
+import re
+import json
+
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -17,10 +21,10 @@ FOLDER_NAME = 'northrop'
 USE_PROXY_DAILY_LIST = False
 USE_PROXY_DETAILED_POSTINGS = False
 USE_PAGINATION = True
-REQUEST_TYPE_LIST = 'post'
+REQUEST_TYPE_LIST = 'get'
 REQUEST_TYPE_SINGLE = 'get'
 
-MAX_JOBS_PER_PAGE = 100
+MAX_JOBS_PER_PAGE = 10
 PAGE_START = 0
 
 # Set PAGINATION_MODE to one of the following:
@@ -30,38 +34,36 @@ PAGE_START = 0
 PAGINATION_MODE = 'offset'
 
 KEY_NAME = 'limit'
-JOBS_LIST_KEY = ['widgets', 0, 'content']
-TOTAL_JOBS_KEY = ['widgets', 0, 'total_item']
+JOBS_LIST_KEY = ['data', 'positions']
+TOTAL_JOBS_KEY = ['data', 'count']
 
 HEADERS = {
-    'accept': '*/*',
+    'accept': 'application/json, text/plain, */*',
     'accept-language': 'de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7',
-    'authorization': '01-05ee7493-03e446b0a771c86519b12d33758e2199a9357b3d',
-    'content-type': 'application/json',
-    'origin': 'https://www.northropgrumman.com',
     'priority': 'u=1, i',
-    'referer': 'https://www.northropgrumman.com/',
-    'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    'referer': 'https://jobs.northropgrumman.com/careers?start=10&pid=1340070980195&sort_by=hot',
+    'sec-ch-ua': '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"macOS"',
     'sec-fetch-dest': 'empty',
     'sec-fetch-mode': 'cors',
-    'sec-fetch-site': 'cross-site',
-    'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'sec-fetch-site': 'same-origin',
+    'sentry-trace': 'bd2e553e625f4460b447f5aff0c26ac6-932e0493ae1bec6b-0',
+    'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
 }
 
-DAILY_JOB_URL = 'https://discover.sitecorecloud.io/discover/v2/136346287'
+DAILY_JOB_URL = 'https://jobs.northropgrumman.com/api/pcsx/search'
 
 JOB_DATA_KEYS = {
-    'created': ['dummy_key'],
+    'created': ['creationTs'],
     'jobTitle': ['name'],
-    'department': [],
+    'department': ['department'],
     'team': [],
-    'location': ['location'],
+    'location': ['locations', 0],
     'country': [],
     'contract': [],
     'id': ['id'],
-    'link': ['url'],
+    'link': ['positionUrl'],
     'career_level': [],
     'employment_type': [],
 }
@@ -71,40 +73,13 @@ extraction_logic = {
 }
 
 PARAMS = {
-    KEY_NAME: MAX_JOBS_PER_PAGE
+    "domain": "ngc.com",
+    "query": "",
+    "location": "",
+    "start": 0,
+    "sort_by": "hot"
 }
-JSON_PAYLOAD = {
-    'context': {
-        'page': {
-            'uri': '/jobs',
-        },
-        'user': {
-            'uuid': '136346287-5p-vd-4c-1p-p6bqhhl9nq31m4h0wmab-1736883124358',
-        },
-        'browser': {
-            'user_agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        },
-    },
-    'widget': {
-        'items': [
-            {
-                'rfk_id': 'jobs_results',
-                'search': {
-                    'content': {},
-                    'facet': {
-                        'all': True,
-                    },
-                    'offset': 0,
-                    'sort': {
-                        'choices': True,
-                    },
-                    'limit': 100,
-                },
-                'entity': 'content',
-            },
-        ],
-    },
-}
+JSON_PAYLOAD = None
 DATA = None
 
 
@@ -148,8 +123,7 @@ def fetch_job_list_page(page):
 
     # Copy existing params
     params = {**PARAMS}
-    json_payload = {**JSON_PAYLOAD}
-    
+
     # Adjust pagination parameters based on PAGINATION_MODE
     if PAGINATION_MODE == 'page':
         # Standard page-based pagination
@@ -157,8 +131,7 @@ def fetch_job_list_page(page):
     elif PAGINATION_MODE == 'offset':
         # Offset-based pagination: offset = page * MAX_JOBS_PER_PAGE
         offset = (page * MAX_JOBS_PER_PAGE)
-        params['offset'] = offset
-        json_payload['widget']['items'][0]['search']['offset'] = offset
+        params['start'] = offset
     elif PAGINATION_MODE == 'firstItem':
         # firstItem-based pagination: firstItem = (page * MAX_JOBS_PER_PAGE) + 1
         first_item = (page * MAX_JOBS_PER_PAGE) + 1
@@ -167,7 +140,7 @@ def fetch_job_list_page(page):
     response = fetch_url(
         DAILY_JOB_URL,
         headers=HEADERS,
-        params=None,
+        params=params,
         json=JSON_PAYLOAD,
         data=DATA,
         use_proxy=USE_PROXY_DAILY_LIST,
@@ -250,6 +223,7 @@ def update_master_list_with_jobs(jobs, master_list):
     new_jobs_count = 0
     inactive_jobs_count = 0
     skipped_jobs_count = 0
+    processed_jobs_count = 0
 
     for job in jobs:
         job_id = job.get('id')
@@ -270,12 +244,20 @@ def update_master_list_with_jobs(jobs, master_list):
             new_jobs_count += 1
 
             # Fetch job details if a link is provided
-            job_link = 'https://www.northropgrumman.com' + job.get('link')
+
+            job_link = 'https://jobs.northropgrumman.com/api/pcsx/position_details'
+
+            params = {
+                'position_id': job_id,
+                'domain': 'ngc.com',
+                'hl': 'de',
+            }
+
             if job_link:
                 response = fetch_url(
                     job_link,
                     headers=HEADERS,
-                    params=PARAMS,
+                    params=params,
                     json=JSON_PAYLOAD,
                     data=DATA,
                     use_proxy=USE_PROXY_DETAILED_POSTINGS,
@@ -284,9 +266,52 @@ def update_master_list_with_jobs(jobs, master_list):
                     request_type=REQUEST_TYPE_SINGLE
                 )
                 if response:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    job_text = soup.get_text()
-                    upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
+                    json_text = json.loads(response.text)
+                    job = json_text.get("data", {})
+
+                    # --- Creation Date (UTC, timezone-aware) ---
+                    creation_ts = job.get("creationTs")
+                    creation_date = (
+                        datetime.fromtimestamp(creation_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+                        if creation_ts
+                        else None
+                    )
+
+                    # --- Job Description (HTML → Clean Text) ---
+                    job_description_html = job.get("jobDescription", "") or ""
+                    job_description_text = re.sub(
+                        r"\s+",
+                        " ",
+                        BeautifulSoup(job_description_html, "html.parser").get_text(separator=" ", strip=True)
+                    ).strip()
+
+                    # --- Location (Fallback auf locations) ---
+                    location = job.get("location")
+                    if not location:
+                        locations = job.get("locations", [])
+                        location = locations[0] if locations else None
+
+                    # --- Neues Dictionary ---
+                    extracted_job = {
+                        "id": job.get("id"),
+                        "name": job.get("name"),
+                        "department": job.get("department"),
+                        "creation_date": creation_date,
+                        "location": location,
+                        "job_description": job_description_text,
+                    }
+
+                    # --- JSON String (für GCS Upload) ---
+                    job_json_string = json.dumps(extracted_job, ensure_ascii=False)
+                    
+                    upload_job_details_to_gcs(job_json_string, job_id, BUCKET_NAME, FOLDER_NAME)
+
+        processed_jobs_count += 1
+
+        # Save the master list after every 1000 processed jobs
+        if processed_jobs_count % 100 == 0:
+            logging.info(f"Saving master list after processing {processed_jobs_count} jobs...")
+            save_master_list(BUCKET_NAME, FOLDER_NAME, master_list)
 
     # Mark old jobs as inactive
     for entry in master_list:
