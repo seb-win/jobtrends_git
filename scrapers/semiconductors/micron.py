@@ -1,12 +1,17 @@
 import logging
-from bs4 import BeautifulSoup
-import re
-
-from orchestrator.util_v2 import get_proxy, fetch_url, load_master_list, save_master_list, get_current_date, get_storage_client, update_job_status, upload_job_details_to_gcs, get_nested_value, send_metrics_to_cloud_function
-import requests
 import time
 import psutil
+from bs4 import BeautifulSoup
+import json
+import re
+from datetime import datetime, UTC
+from html import unescape
 
+from orchestrator.util_v2 import (
+    get_proxy, fetch_url, load_master_list, save_master_list,
+    get_current_date, get_storage_client, update_job_status,
+    upload_job_details_to_gcs, get_nested_value, send_metrics_to_cloud_function
+)
 
 # --------------------------------------
 # Configuration and Constants
@@ -14,8 +19,8 @@ import psutil
 BUCKET_NAME = 'semi_comp'
 FOLDER_NAME = 'micron'
 
-USE_PROXY_DAILY_LIST = True
-USE_PROXY_DETAILED_POSTINGS = True
+USE_PROXY_DAILY_LIST = False
+USE_PROXY_DETAILED_POSTINGS = False
 USE_PAGINATION = True
 REQUEST_TYPE_LIST = 'get'
 REQUEST_TYPE_SINGLE = 'get'
@@ -30,38 +35,36 @@ PAGE_START = 0
 PAGINATION_MODE = 'offset'
 
 KEY_NAME = 'limit'
-JOBS_LIST_KEY = ['positions']
-TOTAL_JOBS_KEY = ['count']
+JOBS_LIST_KEY = ['data','positions']
+TOTAL_JOBS_KEY = ['data','count']
 
 HEADERS = {
-    'accept': '*/*',
+    'accept': 'application/json, text/plain, */*',
     'accept-language': 'de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7',
-    'cache-control': 'max-age=0',
-    'content-type': 'application/json',
-    # 'cookie': 'AMCVS_39BFB008560A6FB87F000101%40AdobeOrg=1; AMCV_39BFB008560A6FB87F000101%40AdobeOrg=179643557%7CMCIDTS%7C20091%7CMCMID%7C82282883802785932483846498049294844966%7CMCAAMLH-1736441108%7C6%7CMCAAMB-1736441108%7CRKhpRz8krg2tLO6pguXWp5olkAcUniQYPHaMWWgdJ3xzPWQmdj0y%7CMCOPTOUT-1735843508s%7CNONE%7CvVersion%7C5.5.0; s_cc=true; _gcl_au=1.1.445087954.1735836308; _ga_GVCT99X2WN=GS1.1.1735836308.1.0.1735836308.0.0.0; _ga=GA1.1.377628405.1735836308; _mkto_trk=id:944-LZM-763&token:_mch-micron.com-1c2d17b7cf0c5c2bc083ecee4fb509c8; OptanonAlertBoxClosed=2025-01-02T16:45:16.922Z; OptanonConsent=isGpcEnabled=0&datestamp=Thu+Jan+02+2025+17%3A45%3A16+GMT%2B0100+(Mitteleurop%C3%A4ische+Normalzeit)&version=202402.1.0&browserGpcFlag=0&isIABGlobal=false&consentId=3576bcff-b42d-44e1-be46-0aca00dcc91d&interactionCount=1&isAnonUser=1&landingPath=NotLandingPage&groups=C0003%3A0%2CC0001%3A1%2CC0004%3A0%2CC0002%3A0&hosts=H203%3A0%2CH145%3A0%2CH207%3A0%2CH147%3A0%2CH131%3A1%2CH155%3A1%2CH114%3A1%2CH87%3A1%2CH224%3A1%2CH115%3A1%2CH9%3A0%2CH198%3A0%2CH151%3A0%2CH60%3A0%2CH182%3A0%2CH183%3A0%2CH219%3A0%2CH184%3A0%2CH100%3A0%2CH61%3A0%2CH220%3A0%2CH62%3A0%2CH186%3A0%2CH164%3A0%2CH63%3A0%2CH64%3A0%2CH14%3A0%2CH142%3A0%2CH110%3A0%2CH66%3A0%2CH67%3A0%2CH153%3A0%2CH18%3A0%2CH19%3A0%2CH20%3A0%2CH69%3A0%2CH144%3A0%2CH70%3A0%2CH21%3A0%2CH211%3A0%2CH71%3A0%2CH72%3A0%2CH167%3A0%2CH23%3A0%2CH25%3A0%2CH26%3A0%2CH179%3A0%2CH96%3A0%2CH102%3A0%2CH187%3A0%2CH74%3A0%2CH6%3A0%2CH195%3A0%2CH31%3A0%2CH154%3A0%2CH32%3A0%2CH188%3A0%2CH75%3A0%2CH189%3A0%2CH76%3A0%2CH226%3A0%2CH201%3A0%2CH34%3A0%2CH1%3A0%2CH2%3A0%2CH35%3A0%2CH77%3A0%2CH78%3A0%2CH248%3A0%2CH79%3A0%2CH190%3A0%2CH191%3A0%2CH169%3A0%2CH80%3A0%2CH40%3A0%2CH41%3A0%2CH98%3A0%2CH81%3A0%2CH43%3A0%2CH213%3A0%2CH7%3A0%2CH44%3A0%2CH46%3A0%2CH82%3A0%2CH227%3A0%2CH241%3A0%2CH156%3A0%2CH48%3A0%2CH83%3A0%2CH49%3A0%2CH86%3A0%2CH3%3A0%2CH197%3A0%2CH52%3A0%2CH192%3A0%2CH53%3A0%2CH54%3A0%2CH232%3A0%2CH193%3A0%2CH194%3A0%2CH101%3A0%2CH88%3A0%2CH57%3A0%2CH185%3A0%2CH113%3A0%2CH196%3A0&genVendors=; s_sq=%5B%5BB%5D%5D; _vs=871386120630828504:1735836319.7613335:5477420368698079494; _vscid=3',
     'priority': 'u=1, i',
-    'referer': 'https://careers.micron.com/careers',
-    'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    'referer': 'https://careers.micron.com/careers?start=0&pid=41159844&sort_by=hot',
+    'sec-ch-ua': '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"macOS"',
     'sec-fetch-dest': 'empty',
     'sec-fetch-mode': 'cors',
     'sec-fetch-site': 'same-origin',
-    'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'sentry-trace': '0a925a0061cd4823856bcb47e85df85f-be1189c215175664-0',
+    'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
 }
 
-DAILY_JOB_URL = 'https://careers.micron.com/api/apply/v2/jobs'
+DAILY_JOB_URL = 'https://careers.micron.com/api/pcsx/search'
 
 JOB_DATA_KEYS = {
-    'created': ['t_create'],
+    'created': ['postedTs'],
     'jobTitle': ['name'],
     'department': ['department'],
     'team': [],
-    'location': ['location'],
+    'location': ['standardizedLocations', 0],
     'country': [],
     'contract': [],
     'id': ['id'],
-    'link': ['canonicalPositionUrl'],
+    'link': [],
     'career_level': [],
     'employment_type': [],
 }
@@ -71,13 +74,33 @@ extraction_logic = {
 }
 
 PARAMS = {
-    ('domain', 'micron.com'),
-    ('num', '10'),
-    ('domain', 'micron.com'),
-    ('sort_by', 'relevance'),
+    "domain": "micron.com",
+    "query": "",
+    "location": "",
+    "start": "0",
+    "sort_by": "timestamp",
 }
 JSON_PAYLOAD = None
 DATA = None
+
+
+def format_creation_ts(creation_ts_raw):
+    """Convert Micron creationTs values from seconds or milliseconds to UTC ISO."""
+    if creation_ts_raw in (None, ""):
+        return None
+
+    try:
+        creation_ts = float(creation_ts_raw)
+    except (TypeError, ValueError):
+        logging.warning(f"Invalid creationTs value: {creation_ts_raw!r}")
+        return None
+
+    # Detail postings may return epoch seconds, while list endpoints often use
+    # milliseconds. Dividing seconds by 1000 produces dates around 1970.
+    if creation_ts > 100_000_000_000:
+        creation_ts /= 1000
+
+    return datetime.fromtimestamp(creation_ts, UTC).isoformat()
 
 
 def process_jobs(job_data, job_data_keys):
@@ -118,28 +141,21 @@ def fetch_job_list_page(page):
     (only set when page == PAGE_START).
     """
 
-    # Copy existing params (convert set to list for easier modification)
-    params = list(PARAMS)
+    # Copy existing params
+    params = {**PARAMS}
 
     # Adjust pagination parameters based on PAGINATION_MODE
     if PAGINATION_MODE == 'page':
         # Standard page-based pagination
-        params.append(('page', page))  # Adding page to the params
-
+        params['page'] = page
     elif PAGINATION_MODE == 'offset':
         # Offset-based pagination: offset = page * MAX_JOBS_PER_PAGE
         offset = (page * MAX_JOBS_PER_PAGE)
-        for i, param in enumerate(params):
-            if param[0] == 'start':
-                params[i] = ('start', offset)  # Update the 'start' parameter
-
+        params['start'] = offset
     elif PAGINATION_MODE == 'firstItem':
         # firstItem-based pagination: firstItem = (page * MAX_JOBS_PER_PAGE) + 1
         first_item = (page * MAX_JOBS_PER_PAGE) + 1
-        params.append(('firstItem', first_item))  # Adding firstItem to the params
-
-    # Convert list back to set
-    params = set(params)
+        params['firstItem'] = first_item
 
     response = fetch_url(
         DAILY_JOB_URL,
@@ -227,6 +243,7 @@ def update_master_list_with_jobs(jobs, master_list):
     new_jobs_count = 0
     inactive_jobs_count = 0
     skipped_jobs_count = 0
+    processed_jobs_count = 0
 
     for job in jobs:
         job_id = job.get('id')
@@ -247,12 +264,18 @@ def update_master_list_with_jobs(jobs, master_list):
             new_jobs_count += 1
 
             # Fetch job details if a link is provided
-            job_link = 'https://careers.micron.com/api/apply/v2/jobs/'+ str(job.get('id'))
+            job_link = 'https://careers.micron.com/api/pcsx/position_details'
+            params = {
+                'position_id': job_id,
+                'domain': 'micron.com',
+                'hl': 'de',
+            }
+
             if job_link:
                 response = fetch_url(
                     job_link,
                     headers=HEADERS,
-                    params=PARAMS,
+                    params=params,
                     json=JSON_PAYLOAD,
                     data=DATA,
                     use_proxy=USE_PROXY_DETAILED_POSTINGS,
@@ -261,11 +284,32 @@ def update_master_list_with_jobs(jobs, master_list):
                     request_type=REQUEST_TYPE_SINGLE
                 )
                 if response:
-                    #soup = BeautifulSoup(response.text, 'html.parser')
-                    #job_text = soup.get_text()
-                    json_obj = response.json()
-                    job_text = json_obj['job_description']
-                    upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
+                    json_job = json.loads(response.text)
+                    job = json_job.get("data", {})
+
+                    creation_ts_readable = format_creation_ts(job.get("creationTs"))
+
+                    cleaned_data = {
+                        "id": job.get("id"),
+                        "creation_ts": creation_ts_readable,
+                        "department": job.get("department"),
+                        "name": job.get("name"),
+                        "location": job.get("location"),
+                        "job_description": clean_html(job.get("jobDescription")),
+                    }
+
+                    # JSON String für GCS
+                    job_json_string = json.dumps(cleaned_data, ensure_ascii=False)
+
+
+                    upload_job_details_to_gcs(job_json_string, job_id, BUCKET_NAME, FOLDER_NAME)
+
+        processed_jobs_count += 1
+
+        # Save the master list after every 1000 processed jobs
+        if processed_jobs_count % 100 == 0:
+            logging.info(f"Saving master list after processing {processed_jobs_count} jobs...")
+            save_master_list(BUCKET_NAME, FOLDER_NAME, master_list)
 
     # Mark old jobs as inactive
     for entry in master_list:
@@ -275,6 +319,20 @@ def update_master_list_with_jobs(jobs, master_list):
 
     return new_jobs_count, inactive_jobs_count, skipped_jobs_count
 
+def clean_html(html_text: str) -> str:
+    if not html_text:
+        return ""
+
+    # HTML entities auflösen
+    html_text = unescape(html_text)
+
+    # HTML entfernen
+    soup = BeautifulSoup(html_text, "html.parser")
+    text = soup.get_text(separator=" ", strip=True)
+
+    # Whitespaces bereinigen
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 def main():
     logging.info(f"Starting job scraping process for {FOLDER_NAME}")
