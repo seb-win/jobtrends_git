@@ -1,0 +1,19 @@
+[{
+    "name": "amazon_scraper",
+    "path": "scrapers/mag7/amazon.py"
+}, {
+    "name": "apple_scraper",
+    "path": "scrapers/mag7/apple.py"
+}, {
+    "name": "google_scraper",
+    "path": "scrapers/mag7/google.py"
+}, {
+    "name": "meta_scraper",
+    "path": "scrapers/mag7/meta.py"
+}, {
+    "name": "microsoft_scraper",
+    "path": "scrapers/mag7/microsoft.py"
+}, {
+    "name": "nvidia_scraper",
+    "path": "scrapers/mag7/nvidia.py"
+}]

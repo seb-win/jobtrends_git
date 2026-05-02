@@ -8,3 +8,4 @@ psutil>=5.9
 psycopg[binary]>=3.1,<4
 pydantic>=2.0,<3
 requests>=2.31
+selenium>=4.20,<5
