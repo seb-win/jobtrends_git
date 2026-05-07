@@ -1,8 +1,11 @@
 import logging
-import json
-from bs4 import BeautifulSoup
 import time
 import psutil
+from bs4 import BeautifulSoup
+import json
+import html
+import re
+
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -13,67 +16,87 @@ from orchestrator.util_v2 import (
 # Configuration and Constants
 # --------------------------------------
 BUCKET_NAME = 'automotive_comp'
-FOLDER_NAME = 'porsche'
+FOLDER_NAME = 'ford'
 
 USE_PROXY_DAILY_LIST = False
-USE_PROXY_DETAILED_POSTINGS = True
+USE_PROXY_DETAILED_POSTINGS = False
 USE_PAGINATION = True
 REQUEST_TYPE_LIST = 'get'
 REQUEST_TYPE_SINGLE = 'get'
 
-MAX_JOBS_PER_PAGE = 10
+MAX_JOBS_PER_PAGE = 25
 PAGE_START = 0
 
 # Set PAGINATION_MODE to one of the following:
 # 'page': Uses page number pagination (existing logic)
 # 'offset': Uses offset-based pagination (offset = page * MAX_JOBS_PER_PAGE)
 # 'firstItem': Uses a firstItem-based pagination (firstItem = (page * MAX_JOBS_PER_PAGE) + 1)
-PAGINATION_MODE = 'firstItem'
+PAGINATION_MODE = 'offset'
 
 KEY_NAME = 'limit'
-JOBS_LIST_KEY = ['SearchResult', 'SearchResultItems']
-TOTAL_JOBS_KEY = ['SearchResult', 'SearchResultCountAll']
+JOBS_LIST_KEY = ['items', 0, 'requisitionList']
+TOTAL_JOBS_KEY = ['items', 0, 'TotalJobsCount']
 
 HEADERS = {
-    'accept': 'application/json, text/javascript, */*; q=0.01',
-    'accept-language': 'de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7',
-    'origin': 'https://jobs.porsche.com',
+    'accept': '*/*',
+    'accept-language': 'en',
+    'content-type': 'application/vnd.oracle.adf.resourceitem+json;charset=utf-8',
+    'ora-irc-cx-userid': '28d94051-678c-4919-9bba-53685e5ef493',
+    'ora-irc-language': 'en',
+    'origin': 'https://apply.ford.com',
     'priority': 'u=1, i',
-    'referer': 'https://jobs.porsche.com/',
-    'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    'referer': 'https://apply.ford.com/',
+    'sec-ch-ua': '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"macOS"',
     'sec-fetch-dest': 'empty',
     'sec-fetch-mode': 'cors',
     'sec-fetch-site': 'cross-site',
-    'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
 }
 
-DAILY_JOB_URL = 'https://porsche-beesite-production-gjb.app.beesite.de/search/'
+DAILY_JOB_URL = 'https://example.com/api/jobs'
 
 JOB_DATA_KEYS = {
-    'created': ['MatchedObjectDescriptor', 'PublicationStartDate'],
-    'jobTitle': ['MatchedObjectDescriptor', 'PositionTitle'],
-    'department': ['MatchedObjectDescriptor', 'JobCategory', 0, 'Name'],
+    'created': ['PostedDate'],
+    'updated': [''],
+    'jobTitle': ['Title'],
+    'department': [],
     'team': [],
-    'location': ['MatchedObjectDescriptor', 'PositionLocation', 0, 'CityName'],
-    'country': ['MatchedObjectDescriptor', 'PositionLocation', 0, 'CountryName'],
-    'contract': ['MatchedObjectDescriptor', 'PositionSchedule', 0, 'Name'],
-    'id': ['MatchedObjectDescriptor', 'ID'],
-    'link': ['MatchedObjectDescriptor', 'PositionURI'],
-    'career_level': ['MatchedObjectDescriptor', 'CareerLevel', 0, 'Name'],
-    'organization': ['MatchedObjectDescriptor', 'ParentOrganizationName'],
+    'location': ['workLocation', 0, 'TownOrCity'],
+    'country': ['workLocation', 0, 'Country'],
+    'contract': [],
+    'id': ['Id'],
+    'link': [],
+    'career_level': [],
+    'employment_type': [],
 }
 
 extraction_logic = {
     # If any specific fields need special handling, define them here.
 }
 
-PARAMS = {
-    'data': '{"LanguageCode":"DE","SearchParameters":{"FirstItem":1,"CountItem":10,"Sort":[{"Criterion":"PublicationStartDate","Direction":"DESC"}],"MatchedObjectDescriptor":["ID","PositionTitle","PositionURI","PositionShortURI","PositionLocation.CountryName","PositionLocation.CityName","PositionLocation.Longitude","PositionLocation.Latitude","PositionLocation.PostalCode","PositionLocation.StreetName","PositionLocation.BuildingNumber","PositionLocation.Distance","JobCategory.Name","PublicationStartDate","ParentOrganizationName","ParentOrganization","OrganizationShortName","CareerLevel.Name","JobSector.Name","PositionIndustry.Name","PublicationCode","PublicationChannel.Id"]},"SearchCriteria":[{"CriterionName":"PublicationChannel.Code","CriterionValue":["12"]}]}',
-}
+PARAMS = {}
 JSON_PAYLOAD = None
 DATA = None
+
+def clean_text(value):
+    if not value:
+        return None
+
+    # HTML entities dekodieren
+    value = html.unescape(value)
+
+    # HTML entfernen
+    text = BeautifulSoup(value, "html.parser").get_text(separator=" ", strip=True)
+
+    # Geschützte Leerzeichen etc. normalisieren
+    text = text.replace("\xa0", " ")
+
+    # Mehrfache Whitespaces entfernen
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
 
 
 def process_jobs(job_data, job_data_keys):
@@ -124,21 +147,28 @@ def fetch_job_list_page(page):
     elif PAGINATION_MODE == 'offset':
         # Offset-based pagination: offset = page * MAX_JOBS_PER_PAGE
         offset = (page * MAX_JOBS_PER_PAGE)
-        params['offset'] = offset
+        #params['offset'] = offset
+        url = (
+            "https://efds.fa.em5.oraclecloud.com/hcmRestApi/resources/latest/recruitingCEJobRequisitions"
+            "?onlyData=true"
+            "&expand=requisitionList.workLocation,requisitionList.otherWorkLocations,requisitionList.secondaryLocations,"
+            "flexFieldsFacet.values,requisitionList.requisitionFlexFields"
+            "&finder=findReqs;"
+            "siteNumber=CX_1,"
+            "facetsList=LOCATIONS%3BWORK_LOCATIONS%3BWORKPLACE_TYPES%3BTITLES%3BCATEGORIES%3BORGANIZATIONS%3BPOSTING_DATES%3BFLEX_FIELDS,"
+            "limit=25,"
+            "sortBy=POSTING_DATES_DESC,"
+            f"offset={offset}"
+        )
     elif PAGINATION_MODE == 'firstItem':
         # firstItem-based pagination: firstItem = (page * MAX_JOBS_PER_PAGE) + 1
         first_item = (page * MAX_JOBS_PER_PAGE) + 1
-        # Parse the JSON string into a Python dictionary
-        data_dict = json.loads(params['data'])
-        # Change the "FirstItem" value
-        data_dict['SearchParameters']['FirstItem'] = first_item  # or any other number you want
-        # Convert back to JSON and update params['data']
-        params['data'] = json.dumps(data_dict)
+        params['firstItem'] = first_item
 
     response = fetch_url(
-        DAILY_JOB_URL,
+        url,
         headers=HEADERS,
-        params=params,
+        params=PARAMS,
         json=JSON_PAYLOAD,
         data=DATA,
         use_proxy=USE_PROXY_DAILY_LIST,
@@ -160,7 +190,7 @@ def fetch_job_list_page(page):
     total_jobs = 0
     if page == PAGE_START:
         total_jobs = get_nested_value(job_data, TOTAL_JOBS_KEY)
-        print(f'Total Jobs: {total_jobs}')
+
     job_list = get_nested_value(job_data, JOBS_LIST_KEY)
     if not isinstance(job_list, list):
         logging.error(f"Unexpected response format: job data is not a list or doesn't contain '{JOBS_LIST_KEY}' key.")
@@ -205,7 +235,7 @@ def fetch_all_jobs():
         job_data, total_jobs_from_response = fetch_job_list_page(PAGE_START)
         if job_data:
             all_jobs.extend(job_data)
-            #logging.info(f"Fetched {len(job_data)} jobs from the single page.")
+            logging.info(f"Fetched {len(job_data)} jobs from the single page.")
         else:
             logging.info("No jobs found on the single page.")
 
@@ -229,11 +259,9 @@ def update_master_list_with_jobs(jobs, master_list):
             skipped_jobs_count += 1
             continue
 
-        job_id_str = str(job_id)
-        existing_entry = next((entry for entry in master_list if str(entry.get('id')) == job_id_str), None)
+        existing_entry = next((entry for entry in master_list if entry['id'] == job_id), None)
 
         if existing_entry:
-            existing_entry.setdefault('status', 'active')
             update_job_status(existing_entry, current_date)
         else:
             # Add new job
@@ -243,37 +271,44 @@ def update_master_list_with_jobs(jobs, master_list):
             master_list.append(job)
             new_jobs_count += 1
 
-            # # Fetch job details if a link is provided
-            job_link = job.get('link')
+            # Fetch job details if a link is provided
+            job_link = f'https://efds.fa.em5.oraclecloud.com/hcmRestApi/resources/latest/recruitingCEJobRequisitionDetails?expand=all&onlyData=true&finder=ById;Id=%22{job_id}%22,siteNumber=CX_1'
             if job_link:
-                try:
-                    response = fetch_url(
-                        job_link,
-                        headers=HEADERS,
-                        params=None,
-                        json=JSON_PAYLOAD,
-                        data=DATA,
-                        use_proxy=USE_PROXY_DETAILED_POSTINGS,
-                        max_retries=3,
-                        timeout=10,
-                        request_type=REQUEST_TYPE_SINGLE
-                    )
-                    if response:
-                        soup = BeautifulSoup(response.text, 'html.parser')
-                        job_text = soup.get_text()
-                        upload_job_details_to_gcs(job_text, job_id_str, BUCKET_NAME, FOLDER_NAME)
-                except Exception as exc:
-                    logging.exception(f"Failed to fetch/upload job details for {FOLDER_NAME} job_id={job_id_str}: {exc}")
+                response = fetch_url(
+                    job_link,
+                    headers=HEADERS,
+                    params=PARAMS,
+                    json=JSON_PAYLOAD,
+                    data=DATA,
+                    use_proxy=USE_PROXY_DETAILED_POSTINGS,
+                    max_retries=3,
+                    timeout=10,
+                    request_type=REQUEST_TYPE_SINGLE
+                )
+                if response:
+                    json_obj = json.loads(response.text)
+                    json_job = json_obj['items'][0]
+                    job_dict = {
+                        "id": json_job.get("Id"),
+                        "job_category": json_job.get("Category"),
+                        "posted": json_job.get("ExternalPostedStartDate"),
+                        "description": clean_text(json_job.get("ExternalDescriptionStr")),
+                        "qualifications": clean_text(json_job.get("ExternalQualificationsStr")),
+                        "responsibilities": clean_text(json_job.get("ExternalResponsibilitiesStr")),
+                    }
+                    job_text = json.dumps(job_dict)
+                    upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
 
         processed_jobs_count += 1
 
+        # Save the master list after every 1000 processed jobs
         if processed_jobs_count % 100 == 0:
             logging.info(f"Saving master list after processing {processed_jobs_count} jobs...")
             save_master_list(BUCKET_NAME, FOLDER_NAME, master_list)
 
     # Mark old jobs as inactive
     for entry in master_list:
-        if entry.get('last_updated') != current_date:
+        if entry['last_updated'] != current_date:
             entry['status'] = 'inactive'
             inactive_jobs_count += 1
 
@@ -282,16 +317,14 @@ def update_master_list_with_jobs(jobs, master_list):
 
 def main():
     logging.info(f"Starting job scraping process for {FOLDER_NAME}")
-
-    # Set starting time and initiate cpu usage measurement
-    start_time = time.time()
+    starting_time = time.time()
     cpu_usage = psutil.cpu_percent(interval=1)
 
     # Step 1: Fetch all jobs
-    all_jobs = fetch_all_jobs()
+    raw_job_data = fetch_all_jobs()
 
     # Step 2: Process jobs using JOB_DATA_KEYS
-    jobs = process_jobs(all_jobs, JOB_DATA_KEYS)
+    jobs = process_jobs(raw_job_data, JOB_DATA_KEYS)
 
     # Step 3: Update master list
     master_list = load_master_list(BUCKET_NAME, FOLDER_NAME)
@@ -300,15 +333,15 @@ def main():
     # Step 4: Save the updated master list
     save_master_list(BUCKET_NAME, FOLDER_NAME, master_list)
 
-    # Calculate execution time
-    execution_time = time.time() - start_time
+    execution_time = time.time() - starting_time
 
     # Summary
     logging.info(f"Scraping completed successfully. {len(jobs)} jobs processed.")
     logging.info(f"{new_jobs_count} new jobs added.")
     logging.info(f"{inactive_jobs_count} jobs marked as inactive.")
     logging.info(f"Total jobs skipped due to missing IDs: {skipped_jobs_count}")
-    send_metrics_to_cloud_function(FOLDER_NAME, execution_time, cpu_usage, len(all_jobs), new_jobs_count, inactive_jobs_count, skipped_jobs_count)
+    send_metrics_to_cloud_function(FOLDER_NAME, execution_time, cpu_usage, len(jobs), new_jobs_count, inactive_jobs_count, skipped_jobs_count)
+
 
 if __name__ == "__main__":
     logging.basicConfig(
