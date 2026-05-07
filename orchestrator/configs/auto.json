@@ -1,12 +1,6 @@
 [{
-    "name": "ford_prof_us_scraper",
-    "path": "scrapers/auto/ford_prof_us.py"
-}, {
-    "name": "ford_prof_nonus_scraper",
-    "path": "scrapers/auto/ford_prof_nonus.py"
-}, {
-    "name": "ford_global_nonprof_scraper",
-    "path": "scrapers/auto/ford_global_nonprof.py"
+    "name": "ford",
+    "path": "scrapers/auto/ford.py"
 }, {
     "name": "stellantis_scraper",
     "path": "scrapers/auto/stellantis.py"

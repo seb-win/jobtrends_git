@@ -22,4 +22,7 @@
 }, {
     "name": "xai_scraper",
     "path": "scrapers/ai/xai.py"
+}, {
+    "name": "blackforest_scraper",
+    "path": "scrapers/ai/blackforest.py"
 }]
