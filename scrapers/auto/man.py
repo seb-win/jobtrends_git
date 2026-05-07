@@ -65,7 +65,7 @@ JOB_DATA_KEYS = {
     'url_added': ['response', 'supportedLocales', 0],
     'career_level': ['response', 'filter6', 0],
     'employment_type': [],
-    'divison': ['response', 'division_obj']
+    'divison': ['response', 'division_obj', 0]
 }
 
 extraction_logic = {
