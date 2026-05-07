@@ -53,14 +53,14 @@ DAILY_JOB_URL = 'https://global-jobboard-api-jobsearch.daimlertruck.com/search/'
 JOB_DATA_KEYS = {
     'created': ['MatchedObjectDescriptor', 'PublicationStartDate'],
     'jobTitle': ['MatchedObjectDescriptor', 'PositionTitle'],
-    'department': ['MatchedObjectDescriptor', 'JobCategory', 0],
+    'department': ['MatchedObjectDescriptor', 'JobCategory', 0, 'Name'],
     'team': [],
     'location': ['MatchedObjectDescriptor', 'PositionLocation', 0, 'CityName'],
     'country': ['MatchedObjectDescriptor', 'PositionLocation', 0, 'CountryName'],
     'contract': [],
     'id': ['MatchedObjectDescriptor', 'ID'],
     'link': ['MatchedObjectDescriptor', 'PositionURI'],
-    'career_level': ['MatchedObjectDescriptor', 0, 'Name'],
+    'career_level': ['MatchedObjectDescriptor','CareerLevel', 0, 'Name'],
     'employment_type': [],
     'division': ['MatchedObjectDescriptor', 'ParentOrganizationName']
 }
