@@ -58,7 +58,7 @@ JOB_DATA_KEYS = {
     'department': ['response', 'filter1', 0],
     'team': [],
     'location': ['response', 'filter7', 0],
-    'country': ['response'],
+    'country': [],
     'contract': [],
     'id': ['response', 'id'],
     'link': ['response', 'urlTitle'],
