@@ -28,6 +28,8 @@ with open(scripts_json_path, "r") as f:
 with open(orchestrator_json_path, "r") as f:
     ORCHESTRATOR_CONFIG = json.load(f)
 
+MAG7_SCRIPT_TIMEOUT = None
+
 
 # Logging setup
 logging.basicConfig(
@@ -44,7 +46,7 @@ def main():
             result = run_script_with_retries(
                 job["path"],
                 max_retries=ORCHESTRATOR_CONFIG["max_retries"],
-                timeout=ORCHESTRATOR_CONFIG["timeout"]
+                timeout=MAG7_SCRIPT_TIMEOUT
             )
             if result:
                 logging.info(f"Script {job['name']} completed successfully.")
