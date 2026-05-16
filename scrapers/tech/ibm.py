@@ -79,12 +79,85 @@ PARAMS = None
 JSON_PAYLOAD = {
     'appId': 'careers',
     'scopes': [
-        'careers',
         'careers2',
     ],
     'query': {
         'bool': {
             'must': [],
+        },
+    },
+    'aggs': {
+        'field_keyword_172': {
+            'filter': {
+                'match_all': {},
+            },
+            'aggs': {
+                'field_keyword_17': {
+                    'terms': {
+                        'field': 'field_keyword_17',
+                        'size': 6,
+                    },
+                },
+                'field_keyword_17_count': {
+                    'cardinality': {
+                        'field': 'field_keyword_17',
+                    },
+                },
+            },
+        },
+        'field_keyword_083': {
+            'filter': {
+                'match_all': {},
+            },
+            'aggs': {
+                'field_keyword_08': {
+                    'terms': {
+                        'field': 'field_keyword_08',
+                        'size': 6,
+                    },
+                },
+                'field_keyword_08_count': {
+                    'cardinality': {
+                        'field': 'field_keyword_08',
+                    },
+                },
+            },
+        },
+        'field_keyword_184': {
+            'filter': {
+                'match_all': {},
+            },
+            'aggs': {
+                'field_keyword_18': {
+                    'terms': {
+                        'field': 'field_keyword_18',
+                        'size': 6,
+                    },
+                },
+                'field_keyword_18_count': {
+                    'cardinality': {
+                        'field': 'field_keyword_18',
+                    },
+                },
+            },
+        },
+        'field_keyword_055': {
+            'filter': {
+                'match_all': {},
+            },
+            'aggs': {
+                'field_keyword_05': {
+                    'terms': {
+                        'field': 'field_keyword_05',
+                        'size': 1000,
+                    },
+                },
+                'field_keyword_05_count': {
+                    'cardinality': {
+                        'field': 'field_keyword_05',
+                    },
+                },
+            },
         },
     },
     'size': 100,
@@ -97,10 +170,18 @@ JSON_PAYLOAD = {
             'pageviews': 'desc',
         },
     ],
+    'lang': 'zz',
+    'localeSelector': {},
+    #'p': 2,
+    'sm': {
+        'query': '',
+        'lang': 'zz',
+    },
     '_source': [
         '_id',
         'title',
         'url',
+        'description',
         'language',
         'entitled',
         'field_keyword_17',
