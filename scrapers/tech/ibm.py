@@ -1,7 +1,9 @@
 import logging
+import os
 import time
 import psutil
 from bs4 import BeautifulSoup
+from orchestrator.render_fetch import RenderFetchError, fetch_rendered_html
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -19,6 +21,9 @@ USE_PROXY_DETAILED_POSTINGS = False
 USE_PAGINATION = True
 REQUEST_TYPE_LIST = 'post'
 REQUEST_TYPE_SINGLE = 'get'
+RENDER_DETAIL_PAGES_HEADLESS = os.environ.get('IBM_RENDER_HEADLESS', 'true').lower() != 'false'
+RENDER_DETAIL_TIMEOUT = int(os.environ.get('IBM_RENDER_TIMEOUT', '30'))
+RENDER_DETAIL_SETTLE_SLEEP = float(os.environ.get('IBM_RENDER_SETTLE_SLEEP', '2'))
 
 MAX_JOBS_PER_PAGE = 100
 PAGE_START = 0
@@ -50,6 +55,7 @@ HEADERS = {
 }
 
 DAILY_JOB_URL = 'https://www-api.ibm.com/search/api/v2'
+IBM_DETAIL_CONTENT_SELECTOR = 'div.article__content__view'
 
 JOB_DATA_KEYS = {
     'created': [],
@@ -104,6 +110,65 @@ JSON_PAYLOAD = {
     ],
 }
 DATA = None
+
+
+def is_waf_challenge(html):
+    """Return True when IBM served the AWS WAF challenge instead of the job page."""
+    if not html:
+        return False
+
+    waf_markers = (
+        'AwsWafIntegration',
+        'challenge-container',
+        'awswaf.com',
+        "verify that you're not a robot",
+    )
+    return any(marker in html for marker in waf_markers)
+
+
+def extract_job_text_from_html(html):
+    if not html or is_waf_challenge(html):
+        return None
+
+    soup = BeautifulSoup(html, 'html.parser')
+    detail_content = soup.select_one(IBM_DETAIL_CONTENT_SELECTOR)
+    if detail_content:
+        return detail_content.get_text('\n', strip=True)
+
+    main_content = soup.find('main')
+    if main_content:
+        text = main_content.get_text('\n', strip=True)
+        if text:
+            return text
+
+    text = soup.get_text('\n', strip=True)
+    return text or None
+
+
+def fetch_rendered_job_text(job_link, job_id):
+    try:
+        html = fetch_rendered_html(
+            job_link,
+            wait_css='body',
+            headless=RENDER_DETAIL_PAGES_HEADLESS,
+            timeout_s=RENDER_DETAIL_TIMEOUT,
+            settle_sleep_s=RENDER_DETAIL_SETTLE_SLEEP,
+            retries=2,
+            user_agent=HEADERS.get('User-Agent'),
+        )
+    except RenderFetchError as exc:
+        logging.warning("Rendered IBM detail fetch failed for job %s: %s", job_id, exc)
+        return None
+
+    if is_waf_challenge(html):
+        logging.warning("IBM WAF challenge returned for job %s; skipping detail upload", job_id)
+        return None
+
+    job_text = extract_job_text_from_html(html)
+    if not job_text:
+        logging.warning("No IBM detail content found for job %s", job_id)
+
+    return job_text
 
 
 def process_jobs(job_data, job_data_keys):
@@ -268,20 +333,8 @@ def update_master_list_with_jobs(jobs, master_list):
             # Fetch job details if a link is provided
             job_link = job.get('link')
             if job_link:
-                response = fetch_url(
-                    job_link,
-                    headers=HEADERS,
-                    params=PARAMS,
-                    json=None,
-                    data=DATA,
-                    use_proxy=USE_PROXY_DETAILED_POSTINGS,
-                    max_retries=3,
-                    timeout=10,
-                    request_type=REQUEST_TYPE_SINGLE
-                )
-                if response:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    job_text = soup.get_text()
+                job_text = fetch_rendered_job_text(job_link, job_id)
+                if job_text:
                     upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
 
     # Mark old jobs as inactive
