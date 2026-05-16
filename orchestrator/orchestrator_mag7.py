@@ -46,7 +46,8 @@ def main():
             result = run_script_with_retries(
                 job["path"],
                 max_retries=ORCHESTRATOR_CONFIG["max_retries"],
-                timeout=MAG7_SCRIPT_TIMEOUT
+                timeout=MAG7_SCRIPT_TIMEOUT,
+                run_as_module=True
             )
             if result:
                 logging.info(f"Script {job['name']} completed successfully.")

@@ -236,11 +236,17 @@ def send_metrics_to_cloud_function(
         logging.error(f"Error sending metrics to Cloud Function: {e}")
 
 
-def run_script_with_retries(script_path, max_retries, timeout):
+def _script_path_to_module(script_path):
+    return Path(script_path).with_suffix("").as_posix().replace("/", ".")
+
+
+def run_script_with_retries(script_path, max_retries, timeout, run_as_module=False):
+    command = ["python3", "-m", _script_path_to_module(script_path)] if run_as_module else ["python3", script_path]
+
     for attempt in range(max_retries):
         try:
             result = subprocess.run(
-                ["python3", script_path],
+                command,
                 timeout=timeout,
                 check=True,
                 capture_output=True
@@ -287,4 +293,3 @@ def clean_html_block(block_html: str) -> str:
     text = fix_encoding(text)
     
     return text
-
