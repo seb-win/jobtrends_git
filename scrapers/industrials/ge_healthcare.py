@@ -71,8 +71,34 @@ JOB_DATA_KEYS = {
     'business_segment': ['businessSegment']
 }
 
+
+def normalize_job_link(value):
+    """Return the first URL-like string from applyUrl, even if the API returns a dict."""
+    if isinstance(value, str):
+        return value
+
+    if isinstance(value, dict):
+        for key in ('url', 'href', 'link', 'value'):
+            normalized = normalize_job_link(value.get(key))
+            if normalized:
+                return normalized
+
+        for nested_value in value.values():
+            normalized = normalize_job_link(nested_value)
+            if normalized:
+                return normalized
+
+    if isinstance(value, list):
+        for item in value:
+            normalized = normalize_job_link(item)
+            if normalized:
+                return normalized
+
+    return None
+
+
 extraction_logic = {
-    # If any specific fields need special handling, define them here.
+    'link': normalize_job_link
 }
 
 PARAMS = None
@@ -271,8 +297,11 @@ def update_master_list_with_jobs(jobs, master_list):
             # Fetch job details if a link is provided
             job_link = job.get('link')
             pattern = r".*(/GEHC_ExternalSite.*?)(?:/apply|$)"
-            match = re.search(pattern, job_link)
-            print(f'Match: {match.group(1)}')
+            match = re.search(pattern, job_link) if isinstance(job_link, str) else None
+            if not match:
+                logging.warning("Skipping detail fetch for job %s due to unexpected link format: %r", job_id, job_link)
+                continue
+
             job_link = 'https://gehc.wd5.myworkdayjobs.com/wday/cxs/gehc' + match.group(1) if match else None
             if job_link:
                 response = fetch_url(
