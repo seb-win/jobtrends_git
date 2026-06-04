@@ -2,8 +2,11 @@ import logging
 import time
 import psutil
 from bs4 import BeautifulSoup
-import re
 import json
+import html
+from datetime import datetime
+import re
+
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -22,8 +25,8 @@ USE_PAGINATION = True
 REQUEST_TYPE_LIST = 'post'
 REQUEST_TYPE_SINGLE = 'get'
 
-MAX_JOBS_PER_PAGE = 500
-PAGE_START = 0
+MAX_JOBS_PER_PAGE = 20
+PAGE_START = 1
 
 # Set PAGINATION_MODE to one of the following:
 # 'page': Uses page number pagination (existing logic)
@@ -32,43 +35,41 @@ PAGE_START = 0
 PAGINATION_MODE = 'offset'
 
 KEY_NAME = 'limit'
-JOBS_LIST_KEY = ['refineSearch', 'data', 'jobs']
-TOTAL_JOBS_KEY = ['refineSearch', 'totalHits']
+JOBS_LIST_KEY = ['jobPostings']
+TOTAL_JOBS_KEY = ['total']
 
 HEADERS = {
-    'accept': '*/*',
-    'accept-language': 'de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7',
+    'accept': 'application/json',
+    'accept-language': 'de-DE',
     'content-type': 'application/json',
-    'origin': 'https://careers.gevernova.com',
+    'origin': 'https://gevernova.wd5.myworkdayjobs.com',
     'priority': 'u=1, i',
-    'referer': 'https://careers.gevernova.com/global/en/search-results',
-    'sec-ch-ua': '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
+    'referer': 'https://gevernova.wd5.myworkdayjobs.com/de-DE/Vernova_ExternalSite/',
+    'sec-ch-ua': '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"macOS"',
     'sec-fetch-dest': 'empty',
     'sec-fetch-mode': 'cors',
     'sec-fetch-site': 'same-origin',
-    'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
-    'x-csrf-token': 'e7c8ad9483ff4e858ac951218038ce04',
+    'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
 }
 
-DAILY_JOB_URL = 'https://careers.gevernova.com/widgets'
+DAILY_JOB_URL = 'https://gevernova.wd5.myworkdayjobs.com/wday/cxs/gevernova/Vernova_ExternalSite/jobs'
 
 JOB_DATA_KEYS = {
-    'created': ['dateCreated'],
+    'created': ['postedOn'],
+    'updated': [],
     'jobTitle': ['title'],
-    'department': ['category'],
+    'department': [],
     'team': [],
-    'location': ['cityStateCountry'],
-    'country': ['country'],
-    'contract': ['type'],
-    'id': ['jobId'],
-    'link': ['applyUrl'],
-    'career_level': ['experienceLevel'],
+    'location': ['locationsText'],
+    'country': [],
+    'contract': [],
+    'id': ['bulletFields', 0],
+    'link': ['externalPath'],
+    'career_level': [],
     'employment_type': [],
-    'skills': ['ml_skills'],
-    'company': ['business'],
-    'business_segment': ['businessSegment']
+    'company': []
 }
 
 extraction_logic = {
@@ -76,40 +77,32 @@ extraction_logic = {
 }
 
 PARAMS = None
+
 JSON_PAYLOAD = {
-    'sortBy': '',
-    'subsearch': '',
-    'from': 0,
-    'jobs': True,
-    'counts': True,
-    'all_fields': [
-        'category',
-        'jobFamilies',
-        'country',
-        'state',
-        'city',
-        'checkRemote',
-        'experienceLevel',
-        'businessSegment',
-    ],
-    'pageName': 'search-results',
-    'size': 500,
-    'clearAll': False,
-    'jdsource': 'facets',
-    'isSliderEnable': False,
-    'pageId': 'page470',
-    'siteType': 'external',
-    'keywords': '',
-    'global': True,
-    'selected_fields': {},
-    'lang': 'en_global',
-    'deviceType': 'desktop',
-    'country': 'global',
-    'refNum': 'GVXGVWGLOBAL',
-    'ddoKey': 'refineSearch',
+    'appliedFacets': {},
+    'limit': 20,
+    'offset': 0,
+    'searchText': '',
 }
 DATA = None
 
+def clean_text(value):
+    if not value:
+        return None
+
+    # HTML entities dekodieren
+    value = html.unescape(value)
+
+    # HTML entfernen
+    text = BeautifulSoup(value, "html.parser").get_text(separator=" ", strip=True)
+
+    # Geschützte Leerzeichen etc. normalisieren
+    text = text.replace("\xa0", " ")
+
+    # Mehrfache Whitespaces entfernen
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
 
 def process_jobs(job_data, job_data_keys):
     """
@@ -150,26 +143,26 @@ def fetch_job_list_page(page):
     """
 
     # Copy existing params
-    json = {**JSON_PAYLOAD}
+    json_payload = {**JSON_PAYLOAD}
 
     # Adjust pagination parameters based on PAGINATION_MODE
     if PAGINATION_MODE == 'page':
         # Standard page-based pagination
-        json['page'] = page
+        json_payload['page_number'] = page
     elif PAGINATION_MODE == 'offset':
         # Offset-based pagination: offset = page * MAX_JOBS_PER_PAGE
         offset = (page * MAX_JOBS_PER_PAGE)
-        json['from'] = offset
+        json_payload['offset'] = offset
     elif PAGINATION_MODE == 'firstItem':
         # firstItem-based pagination: firstItem = (page * MAX_JOBS_PER_PAGE) + 1
         first_item = (page * MAX_JOBS_PER_PAGE) + 1
-        json['firstItem'] = first_item
+        json_payload['firstItem'] = first_item
 
     response = fetch_url(
         DAILY_JOB_URL,
         headers=HEADERS,
         params=PARAMS,
-        json=json,
+        json=json_payload,
         data=DATA,
         use_proxy=USE_PROXY_DAILY_LIST,
         max_retries=3,
@@ -251,6 +244,7 @@ def update_master_list_with_jobs(jobs, master_list):
     new_jobs_count = 0
     inactive_jobs_count = 0
     skipped_jobs_count = 0
+    processed_jobs_count = 0
 
     for job in jobs:
         job_id = job.get('id')
@@ -271,17 +265,13 @@ def update_master_list_with_jobs(jobs, master_list):
             new_jobs_count += 1
 
             # Fetch job details if a link is provided
-            job_link = job.get('link')
-            pattern = r".*(/Vernova_ExternalSite.*?)(?:/apply|$)"
-            match = re.search(pattern, job_link)
-            print(f'Match: {match.group(1)}')
-            job_link = 'https://gevernova.wd5.myworkdayjobs.com/wday/cxs/gevernova' + match.group(1) if match else None
+            job_link = 'https://gevernova.wd5.myworkdayjobs.com/wday/cxs/gevernova/Vernova_ExternalSite/' + job.get('link')
             if job_link:
                 response = fetch_url(
                     job_link,
                     headers=HEADERS,
                     params=PARAMS,
-                    json=None,
+                    json=JSON_PAYLOAD,
                     data=DATA,
                     use_proxy=USE_PROXY_DETAILED_POSTINGS,
                     max_retries=3,
@@ -289,9 +279,30 @@ def update_master_list_with_jobs(jobs, master_list):
                     request_type=REQUEST_TYPE_SINGLE
                 )
                 if response:
-                    json_text = json.loads(response.text)
-                    job_text = json_text['jobPostingInfo']
-                    upload_job_details_to_gcs(str(job_text), job_id, BUCKET_NAME, FOLDER_NAME)
+                    job_json = json.loads(response.text)
+                    job_posting = job_json.get("jobPostingInfo", {})
+                    hiring_org = job_json.get("hiringOrganization", {})
+
+                    job_details = {
+                        "HiringOrganization": hiring_org.get("name"),
+                        "CountryDescriptor": job_posting.get("country", {}).get("descriptor"),
+                        "JobDescription": job_posting.get("jobDescription"),
+                        "JobReqID": job_posting.get("jobReqId"),
+                        "Location": job_posting.get("location"),
+                        "PostedOn": job_posting.get("postedOn"),
+                        "TimeType": job_posting.get("timeType"),
+                        "Title": job_posting.get("title"),
+                        "Scraped": datetime.now().strftime("%Y%m%d")
+                    }
+                    job_text = json.dumps(job_details, ensure_ascii=False, indent=2)
+                    upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
+
+        processed_jobs_count += 1
+
+        # Save the master list after every 1000 processed jobs
+        if processed_jobs_count % 100 == 0:
+            logging.info(f"Saving master list after processing {processed_jobs_count} jobs...")
+            save_master_list(BUCKET_NAME, FOLDER_NAME, master_list)
 
     # Mark old jobs as inactive
     for entry in master_list:
