@@ -44,7 +44,7 @@ def main():
             result = run_script_with_retries(
                 job["path"],
                 max_retries=ORCHESTRATOR_CONFIG["max_retries"],
-                timeout=ORCHESTRATOR_CONFIG["timeout"]
+                timeout=job.get("timeout", ORCHESTRATOR_CONFIG["timeout"])
             )
             if result:
                 logging.info(f"Script {job['name']} completed successfully.")

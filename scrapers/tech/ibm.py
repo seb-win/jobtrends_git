@@ -27,6 +27,7 @@ RENDER_DETAIL_SETTLE_SLEEP = float(os.environ.get('IBM_RENDER_SETTLE_SLEEP', '2'
 
 MAX_JOBS_PER_PAGE = 100
 PAGE_START = 0
+SAVE_EVERY_N_NEW_JOBS = 3
 
 # Set PAGINATION_MODE to one of the following:
 # 'page': Uses page number pagination (existing logic)
@@ -387,6 +388,11 @@ def update_master_list_with_jobs(jobs, master_list):
     """
     Update the master list with new or existing jobs, fetch job details if needed,
     and mark old jobs as inactive.
+
+    Detail upload happens BEFORE the job is appended to the master list so the
+    list only ever contains jobs whose GCS detail file is confirmed present.
+    The master list is also persisted every SAVE_EVERY_N_NEW_JOBS additions so
+    that a process timeout does not discard all progress.
     """
     current_date = get_current_date()
     new_jobs_count = 0
@@ -404,19 +410,25 @@ def update_master_list_with_jobs(jobs, master_list):
         if existing_entry:
             update_job_status(existing_entry, current_date)
         else:
-            # Add new job
             job['scraping_date'] = current_date
             job['last_updated'] = current_date
             job['status'] = 'active'
-            master_list.append(job)
-            new_jobs_count += 1
 
-            # Fetch job details if a link is provided
+            # Fetch and upload details BEFORE adding to master list.
+            # If the upload fails the job is skipped and retried on the next run.
             job_link = job.get('link')
             if job_link:
                 job_text = fetch_rendered_job_text(job_link, job_id)
-                if job_text:
-                    upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
+                if not job_text or not upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME):
+                    skipped_jobs_count += 1
+                    continue
+
+            master_list.append(job)
+            new_jobs_count += 1
+
+            # Persist progress periodically so a timeout doesn't lose everything.
+            if new_jobs_count % SAVE_EVERY_N_NEW_JOBS == 0:
+                save_master_list(BUCKET_NAME, FOLDER_NAME, master_list)
 
     # Mark old jobs as inactive
     for entry in master_list:
