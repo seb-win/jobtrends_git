@@ -8,10 +8,6 @@
     "name": "salesforce_scraper",
     "path": "scrapers/tech/salesforce.py"
 }, {
-    "name": "ibm_scraper",
-    "path": "scrapers/tech/ibm.py",
-    "timeout": 3600
-}, {
     "name": "cisco_scraper",
     "path": "scrapers/tech/cisco_v2.py"
 }, {
