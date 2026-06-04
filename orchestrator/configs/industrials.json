@@ -1,9 +1,11 @@
 [{
     "name": "siemens_scraper",
-    "path": "scrapers/industrials/siemens.py"
+    "path": "scrapers/industrials/siemens.py",
+    "timeout": 3600
 }, {
     "name": "ge_healthcare_scraper",
-    "path": "scrapers/industrials/ge_healthcare.py"
+    "path": "scrapers/industrials/ge_healthcare.py",
+    "timeout": 3600
 }, {
     "name": "ge_vernova_scraper",
     "path": "scrapers/industrials/ge_vernova.py"
