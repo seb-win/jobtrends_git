@@ -3,7 +3,7 @@ import re
 from bs4 import BeautifulSoup
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list, 
-    get_current_date, get_storage_client, update_job_status, upload_job_details_to_gcs, send_metrics_to_cloud_function
+    get_current_date, get_nested_value, get_storage_client, update_job_status, upload_job_details_to_gcs, send_metrics_to_cloud_function
 )
 import time
 import psutil
