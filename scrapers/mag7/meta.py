@@ -1,12 +1,16 @@
 import logging
 import time
 import psutil
+import json
+import re
+import html
 from bs4 import BeautifulSoup
 
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
-    upload_job_details_to_gcs, get_nested_value, send_metrics_to_cloud_function
+    upload_job_details_to_gcs, upload_detailjob_json_to_gcs,
+    get_nested_value, send_metrics_to_cloud_function
 )
 
 # --------------------------------------
@@ -54,6 +58,7 @@ HEADERS = {
 }
 
 DAILY_JOB_URL = 'https://www.metacareers.com/graphql'
+DETAIL_JOB_URL_TEMPLATE = 'https://www.metacareers.com/profile/job_details/{job_id}/'
 
 JOB_DATA_KEYS = {
     'created': [''],
@@ -100,6 +105,206 @@ DATA = {
     'server_timestamps': 'true',
     'doc_id': '9114524511922157',
 }
+
+
+def _clean_text(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        value = "\n".join(str(item) for item in value if item is not None)
+    elif not isinstance(value, str):
+        value = str(value)
+
+    soup = BeautifulSoup(html.unescape(value), "html.parser")
+    text = soup.get_text("\n")
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = text.strip()
+    return text or None
+
+
+def _clean_html_json(value):
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return _clean_text(value.get("__html") or value.get("html") or value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("{"):
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                return _clean_text(parsed.get("__html") or parsed.get("html") or stripped)
+        return _clean_text(stripped)
+    return _clean_text(value)
+
+
+def _items_from_meta_list(values):
+    items = []
+    for value in values or []:
+        if isinstance(value, dict):
+            item = value.get("item")
+        else:
+            item = value
+        cleaned = _clean_text(item)
+        if cleaned:
+            items.append(cleaned)
+    return items
+
+
+def _section(name, heading, text=None, items=None):
+    cleaned_text = _clean_text(text)
+    cleaned_items = [_clean_text(item) for item in (items or [])]
+    cleaned_items = [item for item in cleaned_items if item]
+    if not cleaned_text and not cleaned_items:
+        return None
+    return {
+        "name": name,
+        "heading": heading,
+        "text": cleaned_text,
+        "items": cleaned_items,
+    }
+
+
+def _find_key_recursive(value, target_key):
+    if isinstance(value, dict):
+        if target_key in value:
+            return value[target_key]
+        for child in value.values():
+            found = _find_key_recursive(child, target_key)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _find_key_recursive(child, target_key)
+            if found is not None:
+                return found
+    return None
+
+
+def extract_meta_job_detail_json_from_html(raw_html):
+    soup = BeautifulSoup(raw_html or "", "html.parser")
+    for script in soup.find_all("script", attrs={"type": "application/json"}):
+        raw = (script.string or script.get_text() or "").strip()
+        if "xcp_requisition_job_description" not in raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        detail = _find_key_recursive(payload, "xcp_requisition_job_description")
+        if isinstance(detail, dict):
+            return detail
+
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        raw = (script.string or script.get_text() or "").strip()
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and payload.get("@type") == "JobPosting":
+            return payload
+
+    return None
+
+
+def _compensation_from_meta(node):
+    comps = node.get("public_compensation") if isinstance(node, dict) else None
+    comp = comps[0] if isinstance(comps, list) and comps else {}
+    min_amount = comp.get("compensation_amount_minimum")
+    max_amount = comp.get("compensation_amount_maximum")
+    text_parts = [part for part in [min_amount, max_amount] if part]
+    if comp.get("has_bonus"):
+        text_parts.append("Bonus")
+    if comp.get("has_equity"):
+        text_parts.append("Equity")
+    return {
+        "raw": _clean_text(" - ".join(text_parts)) if text_parts else None,
+        "currency": None,
+        "min": min_amount,
+        "max": max_amount,
+        "period": "year" if any("/year" in str(part) for part in [min_amount, max_amount]) else None,
+        "text": _clean_text("; ".join(text_parts)) if text_parts else None,
+        "locale": comp.get("country_code") if comp else None,
+        "location_id": None,
+    }
+
+
+def build_job_detail_v1_from_json(node):
+    if not isinstance(node, dict):
+        raise ValueError("Meta detail payload must be a dict")
+
+    description = _clean_html_json(node.get("description"))
+    responsibilities = _items_from_meta_list(node.get("responsibilities"))
+    minimum_qualifications = _items_from_meta_list(node.get("minimum_qualifications"))
+    preferred_qualifications = _items_from_meta_list(node.get("preferred_qualifications"))
+    boilerplate = _clean_html_json(node.get("boiler_plate_intro"))
+    equal_opportunity = _clean_html_json(node.get("equal_opportunity_message"))
+    accommodations = _clean_html_json(node.get("accommodations_message"))
+    compensation = _compensation_from_meta(node)
+
+    sections = [
+        _section("description", "Description", text=description),
+        _section("responsibilities", "Responsibilities", items=responsibilities),
+        _section("minimum_qualifications", "Minimum Qualifications", items=minimum_qualifications),
+        _section("preferred_qualifications", "Preferred Qualifications", items=preferred_qualifications),
+        _section("about", "About Meta", text=boilerplate),
+        _section("compensation", "Compensation", text=compensation.get("text")),
+        _section("equal_opportunity", "Equal Opportunity", text=equal_opportunity),
+        _section("additional_information", "Accommodations", text=accommodations),
+    ]
+    sections = [section for section in sections if section]
+
+    full_text = _clean_text("\n\n".join(
+        part for part in [
+            description,
+            "\n".join(responsibilities),
+            "\n".join(minimum_qualifications),
+            "\n".join(preferred_qualifications),
+            boilerplate,
+            compensation.get("text"),
+            equal_opportunity,
+            accommodations,
+        ]
+        if part
+    ))
+
+    departments = node.get("departments") or []
+    internal_departments = node.get("internal_departments") or []
+
+    return {
+        "schema_version": "job_detail_v1",
+        "job": {
+            "id": _clean_text(node.get("id")),
+            "title": _clean_text(node.get("title")),
+            "company": "Meta",
+        },
+        "metadata": {
+            "department": _clean_text(internal_departments[0]) if internal_departments else None,
+            "job_family": _clean_text(departments[0]) if departments else None,
+            "role_type": None,
+            "employment_type": None,
+            "job_type": None,
+            "career_level": None,
+            "experience_level": None,
+            "required_travel": None,
+            "locations": [_clean_text(location) for location in (node.get("locations") or []) if _clean_text(location)],
+            "created_at": None,
+            "posted_at": None,
+            "updated_at": None,
+        },
+        "content": {
+            "full_text": full_text,
+            "full_text_truncated": False,
+            "sections": sections,
+        },
+        "compensation": compensation,
+    }
 
 
 def process_jobs(job_data, job_data_keys):
@@ -261,8 +466,8 @@ def update_master_list_with_jobs(jobs, master_list):
             master_list.append(job)
             new_jobs_count += 1
 
-            # Fetch job details if a link is provided
-            job_link = 'https://www.metacareers.com/jobs/'+job['id']
+            # Fetch job details from Meta's job_details route and upload structured detail JSON.
+            job_link = DETAIL_JOB_URL_TEMPLATE.format(job_id=job['id'])
             if job_link:
                 response = fetch_url(
                     job_link,
@@ -276,9 +481,24 @@ def update_master_list_with_jobs(jobs, master_list):
                     request_type=REQUEST_TYPE_SINGLE
                 )
                 if response:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    job_text = soup.get_text()
-                    upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
+                    try:
+                        detail_json = extract_meta_job_detail_json_from_html(response.text)
+                        if not isinstance(detail_json, dict):
+                            raise ValueError("No Meta detail hydration payload found")
+                        detail_model = build_job_detail_v1_from_json(detail_json)
+                        upload_detailjob_json_to_gcs(
+                            detail_model,
+                            job_id,
+                            BUCKET_NAME,
+                            FOLDER_NAME,
+                        )
+                    except Exception as exc:
+                        logging.warning(
+                            f"Structured Meta detail extraction failed for job {job_id}: {exc}"
+                        )
+                        soup = BeautifulSoup(response.text, 'html.parser')
+                        job_text = soup.get_text()
+                        upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
 
     # Mark old jobs as inactive
     for entry in master_list:

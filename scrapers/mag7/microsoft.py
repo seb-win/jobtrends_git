@@ -3,9 +3,22 @@ import time
 import psutil
 import json
 import gc
+import re
 from dataclasses import dataclass, field
-from bs4 import BeautifulSoup
+from datetime import datetime, UTC
 
+try:
+    from bs4 import BeautifulSoup
+except ModuleNotFoundError:  # pragma: no cover - depends on runtime environment
+    BeautifulSoup = None
+
+from orchestrator.schemas.job_detail_v1 import (
+    build_full_text,
+    clean_text,
+    make_job_detail,
+    make_section,
+    map_section_name,
+)
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -83,6 +96,219 @@ JSON_PAYLOAD = None
 DATA = None
 
 
+def format_time_ts(timestamp_raw):
+    """Convert Microsoft epoch timestamps from seconds or milliseconds to UTC ISO."""
+    if timestamp_raw in (None, ""):
+        return None
+
+    try:
+        timestamp = float(timestamp_raw)
+    except (TypeError, ValueError):
+        logging.warning("Invalid timestamp value: %r", timestamp_raw)
+        return None
+
+    if timestamp > 100_000_000_000:
+        timestamp /= 1000
+
+    return datetime.fromtimestamp(timestamp, UTC).isoformat()
+
+
+def first_or_none(value):
+    if isinstance(value, list) and value:
+        return value[0]
+    return value
+
+
+def _clean_direct_text(element):
+    parts = []
+    for child in element.children:
+        if isinstance(child, str):
+            parts.append(child)
+        elif child.name == "br":
+            parts.append("\n")
+        elif child.name not in {"ul", "ol"}:
+            parts.append(child.get_text(" ", strip=True))
+    return clean_text(" ".join(parts))
+
+
+def _collect_list_items(element):
+    items = []
+    for li in element.find_all("li"):
+        item = clean_text(li.get_text(" ", strip=True))
+        if item:
+            items.append(item)
+    return items
+
+
+def _section_text_from_parts(parts):
+    texts = []
+    for part in parts:
+        if part.name in {"ul", "ol"}:
+            continue
+        text = clean_text(part.get_text(" ", strip=True))
+        if text:
+            texts.append(text)
+    return build_full_text(*texts)
+
+
+def extract_job_description_sections(job_description_html):
+    if not job_description_html:
+        return []
+
+    if BeautifulSoup is None:
+        return extract_job_description_sections_fallback(job_description_html)
+
+    soup = BeautifulSoup(job_description_html, "html.parser")
+    sections = []
+    intro_parts = []
+    current_heading = None
+    current_parts = []
+
+    def flush_current():
+        nonlocal current_heading, current_parts
+        if current_heading:
+            items = []
+            for part in current_parts:
+                if part.name in {"ul", "ol"}:
+                    items.extend(_collect_list_items(part))
+            section = make_section(
+                map_microsoft_section_name(current_heading),
+                heading=current_heading,
+                text=_section_text_from_parts(current_parts),
+                items=items,
+            )
+            if section:
+                sections.append(section)
+        elif current_parts:
+            for part in current_parts:
+                text = clean_text(part.get_text(" ", strip=True))
+                if text:
+                    intro_parts.append(text)
+
+        current_heading = None
+        current_parts = []
+
+    for child in soup.contents:
+        if isinstance(child, str):
+            text = clean_text(child)
+            if text and current_heading:
+                current_parts.append(BeautifulSoup(text, "html.parser"))
+            elif text:
+                intro_parts.append(text)
+            continue
+
+        if child.name in {"b", "strong"}:
+            heading = clean_text(child.get_text(" ", strip=True))
+            if heading:
+                flush_current()
+                current_heading = heading
+            continue
+
+        if child.name == "p":
+            bold = child.find(["b", "strong"], recursive=False)
+            direct_text = _clean_direct_text(child)
+            if bold and direct_text == clean_text(bold.get_text(" ", strip=True)):
+                flush_current()
+                current_heading = direct_text
+                continue
+
+        if child.name in {"p", "ul", "ol", "div"}:
+            current_parts.append(child)
+
+    flush_current()
+
+    intro_text = build_full_text(*intro_parts)
+    if intro_text:
+        sections.insert(0, make_section("description", heading="Overview", text=intro_text))
+
+    return [section for section in sections if section]
+
+
+def map_microsoft_section_name(heading):
+    normalized = (clean_text(heading) or "").casefold()
+    if normalized == "qualifications":
+        return "qualifications"
+    return map_section_name(heading)
+
+
+def extract_job_description_sections_fallback(job_description_html):
+    sections = []
+    chunks = re.split(
+        r"<b>\s*(Overview|Responsibilities|Qualifications)\s*</b>\s*<br\s*/?>",
+        job_description_html,
+        flags=re.IGNORECASE,
+    )
+    for index in range(1, len(chunks), 2):
+        heading = clean_text(chunks[index])
+        html_chunk = chunks[index + 1]
+        items = [
+            clean_text(item)
+            for item in re.findall(r"<li[^>]*>(.*?)</li>", html_chunk, flags=re.IGNORECASE | re.DOTALL)
+        ]
+        items = [item for item in items if item]
+        text = clean_text(html_chunk, separator="\n")
+        section = make_section(
+            "description" if heading and heading.casefold() == "overview" else map_microsoft_section_name(heading),
+            heading=heading,
+            text=text,
+            items=items,
+        )
+        if section:
+            sections.append(section)
+    return sections
+
+
+def extract_compensation(full_text):
+    if not full_text:
+        return None
+
+    match = re.search(
+        r"(typical base pay range.*?USD\s*\$([\d,]+)\s*-\s*\$([\d,]+)\s*per\s+year.*?)"
+        r"(?=\s+Certain roles|\s+This position|\s+Microsoft is an equal opportunity|$)",
+        full_text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    raw = clean_text(match.group(1))
+    return {
+        "raw": raw,
+        "currency": "USD",
+        "min": int(match.group(2).replace(",", "")),
+        "max": int(match.group(3).replace(",", "")),
+        "period": "year",
+        "text": raw,
+        "locale": "US",
+    }
+
+
+def build_job_detail_v1_from_json(detail_json):
+    data = detail_json.get("data", {}) if isinstance(detail_json, dict) else {}
+    job_description_html = data.get("jobDescription")
+    full_text = clean_text(job_description_html, separator="\n")
+
+    return make_job_detail(
+        job_id=data.get("id"),
+        title=data.get("name"),
+        company="Microsoft",
+        metadata={
+            "department": first_or_none(data.get("efcustomTextTaDisciplineName")) or data.get("department"),
+            "job_family": first_or_none(data.get("efcustomTextCurrentProfession")),
+            "role_type": first_or_none(data.get("efcustomTextRoletype")),
+            "employment_type": first_or_none(data.get("efcustomTextEmploymentType")),
+            "job_type": data.get("workLocationOption"),
+            "required_travel": first_or_none(data.get("efcustomTextRequiredTravel")),
+            "locations": data.get("locations") or data.get("location"),
+            "created_at": format_time_ts(data.get("creationTs")),
+            "posted_at": format_time_ts(data.get("postedTs")),
+        },
+        full_text=full_text,
+        sections=extract_job_description_sections(job_description_html),
+        compensation=extract_compensation(full_text),
+    )
+
+
 @dataclass
 class DetailErrorCollector:
     failures: dict = field(default_factory=dict)
@@ -132,33 +358,6 @@ class DetailErrorCollector:
             )
 
 
-def _build_job_detail_text(job_data):
-    department = job_data.get("department")
-    job_title = job_data.get("name")
-    job_description_html = job_data.get("jobDescription")
-
-    def first_or_none(value):
-        return value[0] if isinstance(value, list) and value else None
-
-    current_profession = first_or_none(job_data.get("efcustomTextCurrentProfession"))
-    employment_type = first_or_none(job_data.get("efcustomTextEmploymentType"))
-    required_travel = first_or_none(job_data.get("efcustomTextRequiredTravel"))
-    role_type = first_or_none(job_data.get("efcustomTextRoletype"))
-    locations = job_data.get("locations", [])
-
-    full_json = {
-        "title": job_title,
-        "department": department,
-        "current_profession": current_profession,
-        "employment_type": employment_type,
-        "required_travel": required_travel,
-        "role_type": role_type,
-        "job_description_html": job_description_html,
-        "locations": locations,
-    }
-    return json.dumps(full_json)
-
-
 def fetch_and_store_job_details(job):
     job_id = job.get('id')
     if not job_id:
@@ -195,7 +394,8 @@ def fetch_and_store_job_details(job):
     if not isinstance(job_data, dict):
         return False, "detail response missing data object"
 
-    job_text = _build_job_detail_text(job_data)
+    job_detail = build_job_detail_v1_from_json(obj)
+    job_text = json.dumps(job_detail, ensure_ascii=False)
     upload_success = upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
     if not upload_success:
         return False, "upload to GCS failed"

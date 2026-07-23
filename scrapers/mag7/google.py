@@ -3,6 +3,7 @@ import re
 from bs4 import BeautifulSoup
 import json
 import gc
+import html
 
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list, 
@@ -83,6 +84,167 @@ extraction_logic = {
     'href': lambda el: el.get('href', 'No HREF'),
     # Add more special cases if needed
 }
+
+
+def _clean_text(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        value = "\n".join(str(item) for item in value if item is not None)
+    elif not isinstance(value, str):
+        value = str(value)
+
+    soup = BeautifulSoup(html.unescape(value), "html.parser")
+    text = soup.get_text("\n")
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = text.strip()
+    return text or None
+
+
+def _element_text(element):
+    if not element:
+        return None
+    return _clean_text(element.get_text("\n", strip=True))
+
+
+def _section(name, heading, text=None, items=None):
+    cleaned_text = _clean_text(text)
+    cleaned_items = [_clean_text(item) for item in (items or [])]
+    cleaned_items = [item for item in cleaned_items if item]
+    if not cleaned_text and not cleaned_items:
+        return None
+    return {
+        "name": name,
+        "heading": heading,
+        "text": cleaned_text,
+        "items": cleaned_items,
+    }
+
+
+def build_job_detail_v1_from_html(html_text, job_id=None):
+    soup = BeautifulSoup(html_text or "", 'html.parser')
+    root = soup.select_one("div.DkhPwc[data-id]") or soup.select_one("[data-title]") or soup
+
+    title_el = root.select_one("h2.p1N2lc")
+    title = _element_text(title_el) or _clean_text(root.get("data-title"))
+
+    company_el = root.select_one("div.op1BBf span.RP7SMd > span")
+    company = _element_text(company_el) or "Google"
+
+    location_els = root.select("div.op1BBf span.pwO9Dc span.r0wTof")
+    locations = []
+    for el in location_els:
+        location = _element_text(el)
+        location = re.sub(r"^[;\s]+", "", location) if location else None
+        if location and location not in locations:
+            locations.append(location)
+
+    exp_el = root.select_one("div.op1BBf span.wVSTAb")
+    experience_level = _element_text(exp_el)
+
+    sections = []
+    full_text_parts = []
+
+    qual_container = root.select_one("div.KwJkGe")
+    if qual_container:
+        for h3 in qual_container.select(":scope > h3"):
+            heading = _element_text(h3)
+            ul = h3.find_next_sibling("ul")
+            if not heading or not ul:
+                continue
+
+            items = [
+                _element_text(li)
+                for li in ul.select(":scope > li")
+                if _element_text(li)
+            ]
+            section_name = "qualifications"
+            heading_lower = heading.lower()
+            if "minimum" in heading_lower:
+                section_name = "minimum_qualifications"
+            elif "preferred" in heading_lower:
+                section_name = "preferred_qualifications"
+
+            section = _section(
+                section_name,
+                heading,
+                text=ul.get_text("\n", strip=True),
+                items=items,
+            )
+            if section:
+                sections.append(section)
+                full_text_parts.append(section["text"])
+
+    about_el = root.select_one("div.aG5W3")
+    about_section = _section(
+        "description",
+        "About the job",
+        text=about_el.get_text("\n", strip=True) if about_el else None,
+    )
+    if about_section:
+        sections.append(about_section)
+        full_text_parts.append(about_section["text"])
+
+    resp_el = root.select_one("div.BDNOWe")
+    responsibilities_section = _section(
+        "responsibilities",
+        "Responsibilities",
+        text=resp_el.get_text("\n", strip=True) if resp_el else None,
+    )
+    if responsibilities_section:
+        sections.append(responsibilities_section)
+        full_text_parts.append(responsibilities_section["text"])
+
+    eeo_el = root.select_one("p.MLx3Ee")
+    eeo_section = _section(
+        "equal_opportunity",
+        "Equal Opportunity",
+        text=eeo_el.get_text("\n", strip=True) if eeo_el else None,
+    )
+    if eeo_section:
+        sections.append(eeo_section)
+
+    full_text = "\n\n".join(part for part in full_text_parts if part) or None
+
+    return {
+        "schema_version": "job_detail_v1",
+        "job": {
+            "id": job_id or root.get("data-id"),
+            "title": title,
+            "company": company,
+        },
+        "metadata": {
+            "department": None,
+            "job_family": None,
+            "role_type": None,
+            "employment_type": None,
+            "job_type": None,
+            "career_level": None,
+            "experience_level": experience_level,
+            "required_travel": None,
+            "locations": locations,
+            "created_at": None,
+            "posted_at": None,
+            "updated_at": None,
+        },
+        "content": {
+            "full_text": full_text,
+            "full_text_truncated": False,
+            "sections": sections,
+        },
+        "compensation": {
+            "raw": None,
+            "currency": None,
+            "min": None,
+            "max": None,
+            "period": None,
+            "text": None,
+            "locale": None,
+            "location_id": None,
+        },
+    }
 
 
 def process_jobs(job_postings):
@@ -290,91 +452,7 @@ def update_master_list_with_jobs(all_jobs, master_list):
                     request_type=REQUEST_TYPE_SINGLE
                 )
                 if response:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-
-                    root = soup.select_one("div.DkhPwc[data-id]")
-
-                    # --- basics ---
-                    title_el = root.select_one("h2.p1N2lc")
-                    title = title_el.get_text(" ", strip=True) if title_el else None
-
-                    meta_el = root.select_one("div.op1BBf")
-
-                    company_el = root.select_one("div.op1BBf span.RP7SMd > span")
-                    company = company_el.get_text(" ", strip=True) if company_el else None
-
-                    # multiple locations possible
-                    location_els = root.select("div.op1BBf span.pwO9Dc span.r0wTof")
-                    locations = [
-                        el.get_text(" ", strip=True)
-                        for el in location_els
-                        if el.get_text(strip=True)
-                    ]
-
-                    exp_el = root.select_one("div.op1BBf span.wVSTAb")
-                    experience_level = exp_el.get_text(" ", strip=True) if exp_el else None
-
-
-                    # --- qualification blocks ---
-                    qual_container = root.select_one("div.KwJkGe")
-
-                    min_text = None
-                    pref_text = None
-                    min_items = []
-                    pref_items = []
-
-                    if qual_container:
-                        h3s = qual_container.select(":scope > h3")
-                        for h3 in h3s:
-                            heading = h3.get_text(" ", strip=True).lower()
-                            ul = h3.find_next_sibling("ul")
-                            if not ul:
-                                continue
-
-                            items = [
-                                li.get_text(" ", strip=True)
-                                for li in ul.select(":scope > li")
-                                if li.get_text(strip=True)
-                            ]
-
-                            cleaned_text = clean_html_block(str(ul))
-
-                            if "minimum" in heading:
-                                min_text = cleaned_text
-                                min_items = items
-                            elif "preferred" in heading:
-                                pref_text = cleaned_text
-                                pref_items = items
-
-
-                    # --- content blocks ---
-                    about_el = root.select_one("div.aG5W3")
-                    about_text = clean_html_block(str(about_el)) if about_el else None
-
-                    resp_el = root.select_one("div.BDNOWe")
-                    responsibilities_text = clean_html_block(str(resp_el)) if resp_el else None
-
-
-                    # --- build JSON object ---
-                    data = {
-                        "title": title,
-                        "company": company,
-                        "locations": locations,
-                        "experience_level": experience_level,
-
-                        "minimum_qualifications": {
-                            "text": min_text,
-                            "items": min_items,
-                        },
-                        "preferred_qualifications": {
-                            "text": pref_text,
-                            "items": pref_items,
-                        },
-
-                        "about_text": about_text,
-                        "responsibilities_text": responsibilities_text,
-                    }
-
+                    data = build_job_detail_v1_from_html(response.text, job_id=job_id)
                     job_text = json.dumps(data, ensure_ascii=False)
 
                     upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)

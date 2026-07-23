@@ -4,6 +4,8 @@ import psutil
 from bs4 import BeautifulSoup
 import json
 import gc
+import html
+import re
 
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
@@ -95,6 +97,194 @@ JSON_PAYLOAD = {
     },
 }
 DATA = None
+
+
+def _clean_text(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        value = "\n".join(str(item) for item in value if item is not None)
+    elif not isinstance(value, str):
+        value = str(value)
+
+    soup = BeautifulSoup(html.unescape(value), "html.parser")
+    text = soup.get_text("\n")
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = text.strip()
+    return text or None
+
+
+def _list_items_from_lines(value):
+    text = _clean_text(value)
+    if not text:
+        return []
+
+    items = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        item = re.sub(r"^[-*•]\s*", "", line).strip()
+        if item:
+            items.append(item)
+    return items
+
+
+def _bullet_items_from_lines(value):
+    text = _clean_text(value)
+    if not text:
+        return []
+
+    items = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or not re.match(r"^[-*•]\s+", line):
+            continue
+        items.append(re.sub(r"^[-*•]\s*", "", line).strip())
+    return [item for item in items if item]
+
+
+def _section(name, heading, text=None, items=None):
+    cleaned_text = _clean_text(text)
+    cleaned_items = [_clean_text(item) for item in (items or [])]
+    cleaned_items = [item for item in cleaned_items if item]
+    if not cleaned_text and not cleaned_items:
+        return None
+    return {
+        "name": name,
+        "heading": heading,
+        "text": cleaned_text,
+        "items": cleaned_items,
+    }
+
+
+def _locations_from_jobs_data(jobs_data):
+    locations = []
+    for location in jobs_data.get("locations") or []:
+        if not isinstance(location, dict):
+            continue
+        parts = [
+            location.get("city") or location.get("name"),
+            location.get("stateProvince"),
+            location.get("countryName"),
+        ]
+        cleaned_location = _clean_text(", ".join(part for part in parts if part))
+        if cleaned_location and cleaned_location not in locations:
+            locations.append(cleaned_location)
+    return locations
+
+
+def _pay_data_from_jobs_data(jobs_data):
+    ppld = jobs_data.get("postingPostLocationData", {}) or {}
+    locale = "en_US" if "en_US" in ppld else (next(iter(ppld.keys())) if ppld else None)
+
+    loc_id = None
+    if jobs_data.get("locations"):
+        loc_id = jobs_data["locations"][0].get("id")
+
+    pay = None
+    other = None
+    if locale and loc_id:
+        location_data = ppld.get(locale, {}).get(loc_id, {}) or {}
+        pay = location_data.get("postingSupplementFooter")
+        other = location_data.get("otherPostingSupplementFooter")
+
+    pay_text = _clean_text((pay or {}).get("content"))
+    other_text = _clean_text((other or {}).get("content"))
+    if not pay_text:
+        for footer in jobs_data.get("postingFooters") or []:
+            localizations = (footer or {}).get("localizations", {}) or {}
+            locale_entries = localizations.get(locale or "en_US") or []
+            for entry in locale_entries:
+                pay_text = _clean_text((entry or {}).get("content"))
+                if pay_text:
+                    break
+            if pay_text:
+                break
+    compensation_text = "\n\n".join(text for text in [pay_text, other_text] if text) or None
+    raw_label = _clean_text((pay or {}).get("label"))
+
+    return {
+        "raw": raw_label,
+        "currency": None,
+        "min": None,
+        "max": None,
+        "period": None,
+        "text": compensation_text,
+        "locale": locale if compensation_text else None,
+        "location_id": loc_id if compensation_text else None,
+    }
+
+
+def build_job_detail_v1_from_json(data):
+    job_details = data.get("loaderData", {}).get("jobDetails", {}) if isinstance(data, dict) else {}
+    jobs_data = job_details.get("jobsData", {}) or {}
+    compensation = _pay_data_from_jobs_data(jobs_data)
+
+    sections = [
+        _section("about", "Summary", jobs_data.get("jobSummary")),
+        _section(
+            "responsibilities",
+            "Description",
+            text=None if _bullet_items_from_lines(jobs_data.get("description")) else jobs_data.get("description"),
+            items=_bullet_items_from_lines(jobs_data.get("description")),
+        ),
+        _section(
+            "minimum_qualifications",
+            "Minimum Qualifications",
+            items=_list_items_from_lines(jobs_data.get("minimumQualifications")),
+        ),
+        _section(
+            "preferred_qualifications",
+            "Preferred Qualifications",
+            items=_list_items_from_lines(jobs_data.get("preferredQualifications")),
+        ),
+        _section("compensation", "Pay & Benefits", compensation["text"]),
+    ]
+    sections = [section for section in sections if section]
+
+    full_text_parts = [
+        jobs_data.get("jobSummary"),
+        jobs_data.get("description"),
+        jobs_data.get("minimumQualifications"),
+        jobs_data.get("preferredQualifications"),
+        compensation["text"],
+    ]
+    full_text = _clean_text("\n\n".join(part for part in full_text_parts if part))
+
+    team_names = jobs_data.get("teamNames") or []
+    department = _clean_text(team_names[0]) if team_names else None
+
+    return {
+        "schema_version": "job_detail_v1",
+        "job": {
+            "id": jobs_data.get("positionId"),
+            "title": _clean_text(jobs_data.get("postingTitle")),
+            "company": "Apple",
+        },
+        "metadata": {
+            "department": department,
+            "job_family": None,
+            "role_type": None,
+            "employment_type": _clean_text(jobs_data.get("employmentType")),
+            "job_type": _clean_text(jobs_data.get("jobType")),
+            "career_level": None,
+            "experience_level": None,
+            "required_travel": None,
+            "locations": _locations_from_jobs_data(jobs_data),
+            "created_at": None,
+            "posted_at": jobs_data.get("postDateInGMT"),
+            "updated_at": None,
+        },
+        "content": {
+            "full_text": full_text,
+            "full_text_truncated": False,
+            "sections": sections,
+        },
+        "compensation": compensation,
+    }
 
 
 def process_jobs(job_data, job_data_keys):
@@ -373,49 +563,7 @@ def update_master_list_with_jobs(jobs, master_list):
                 #     soup = BeautifulSoup(response.text, 'html.parser')
                 #     job_text = soup.get_text()
                 #     upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
-                jobs = data.get("loaderData", {}).get("jobDetails", {}).get("jobsData", {})
-                job_details = data.get("loaderData", {}).get("jobDetails", {})
-
-                # --- Pay & Benefits (nur einmal, bevorzugt en_US) ---
-                ppld = jobs.get("postingPostLocationData", {}) or {}
-                locale = "en_US" if "en_US" in ppld else (next(iter(ppld.keys())) if ppld else None)
-
-                loc_id = None
-                if jobs.get("locations"):
-                    loc_id = jobs["locations"][0].get("id")
-
-                pay = None
-                other = None
-                if locale and loc_id:
-                    pay = ppld.get(locale, {}).get(loc_id, {}).get("postingSupplementFooter")
-                    other = ppld.get(locale, {}).get(loc_id, {}).get("otherPostingSupplementFooter")
-
-                # --- Ziel-JSON bauen (mit .get(), damit nichts crasht wenn Felder fehlen) ---
-                out = {
-                    "positionId": jobs.get("positionId"),
-                    "postingTitle": jobs.get("postingTitle"),
-                    "transformedPostingTitle": jobs.get("transformedPostingTitle"),
-                    "requestUrl": job_details.get("requestUrl"),
-                    "description": jobs.get("description"),
-                    "minimumQualifications": jobs.get("minimumQualifications"),
-                    "preferredQualifications": jobs.get("preferredQualifications"),
-                    "teamNames": jobs.get("teamNames"),
-                    "locations": jobs.get("locations"),
-                    "postDateInGMT": jobs.get("postDateInGMT"),
-                    "jobType": jobs.get("jobType"),
-                    "employmentType": jobs.get("employmentType"),  # kann bei manchen Jobs fehlen -> None ok
-                    "payAndBenefits": {
-                        "locale": locale,
-                        "locationId": loc_id,
-                        "label": (pay or {}).get("label"),
-                        "content_html": (pay or {}).get("content"),
-                    } if pay else None,
-                    "otherPostingSupplement": {
-                        "locale": locale,
-                        "locationId": loc_id,
-                        "content_html": (other or {}).get("content"),
-                    } if other else None,
-                }
+                out = build_job_detail_v1_from_json(data)
 
                 # --- Als String für GCS ---
                 out_json_str = json.dumps(out, ensure_ascii=False)

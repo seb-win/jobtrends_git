@@ -2,10 +2,17 @@ import logging
 import time
 import psutil
 import json
+import re
 
 from orchestrator.util_v2 import (
     fetch_url, get_current_date, get_storage_client, update_job_status,
     get_nested_value, send_metrics_to_cloud_function
+)
+from orchestrator.schemas.job_detail_v1 import (
+    build_full_text,
+    clean_text,
+    make_job_detail,
+    make_section,
 )
 
 # --------------------------------------
@@ -248,11 +255,118 @@ def process_jobs(job_data, job_data_keys):
     return jobs
 
 
+def _team_label(raw_job):
+    team = raw_job.get("team")
+    if isinstance(team, dict):
+        label = team.get("label")
+        if label and label != "no-team-listed":
+            return label
+    return None
+
+
+def _location_values(raw_job):
+    locations = []
+
+    def add_location(value):
+        cleaned = clean_text(value)
+        if cleaned and cleaned not in locations:
+            locations.append(cleaned)
+
+    add_location(raw_job.get("normalized_location"))
+
+    raw_locations = raw_job.get("locations")
+    if not isinstance(raw_locations, list):
+        raw_locations = [raw_locations] if raw_locations else []
+
+    for raw_location in raw_locations:
+        location_value = raw_location
+        if isinstance(raw_location, str):
+            try:
+                location_value = json.loads(raw_location)
+            except ValueError:
+                location_value = raw_location
+
+        if isinstance(location_value, dict):
+            add_location(location_value.get("normalizedLocation") or location_value.get("location"))
+        else:
+            add_location(location_value)
+
+    if not locations:
+        add_location(raw_job.get("location"))
+
+    return locations
+
+
+def extract_amazon_compensation(*text_parts):
+    full_text = build_full_text(*text_parts)
+    if not full_text:
+        return None
+
+    match = re.search(
+        r"((?:USA|US),\s*[^-\n]+(?:,\s*[^-\n]+)?\s*-\s*"
+        r"([\d,]+(?:\.\d+)?)\s*-\s*([\d,]+(?:\.\d+)?)\s*USD\s*(annually|hourly|monthly)?)",
+        full_text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    raw = clean_text(match.group(1))
+    period = match.group(4).casefold() if match.group(4) else None
+    if period == "annually":
+        period = "year"
+
+    return {
+        "raw": raw,
+        "currency": "USD",
+        "min": float(match.group(2).replace(",", "")),
+        "max": float(match.group(3).replace(",", "")),
+        "period": period,
+        "text": raw,
+        "locale": "US",
+    }
+
+
+def build_job_detail_v1_from_json(raw_job):
+    """
+    Build job_detail_v1 from the Amazon search entry.
+
+    Amazon includes detail fields in the daily list response, so no separate detail URL
+    is fetched for detail JSON generation.
+    """
+    description = raw_job.get("description")
+    basic_qualifications = raw_job.get("basic_qualifications")
+    preferred_qualifications = raw_job.get("preferred_qualifications")
+    full_text = build_full_text(description, basic_qualifications, preferred_qualifications)
+
+    return make_job_detail(
+        job_id=raw_job.get("id"),
+        title=raw_job.get("title"),
+        company=raw_job.get("company_name"),
+        metadata={
+            "department": _team_label(raw_job),
+            "job_family": raw_job.get("job_family") or raw_job.get("job_category"),
+            "employment_type": raw_job.get("job_schedule_type"),
+            "job_type": raw_job.get("location_type"),
+            "locations": _location_values(raw_job),
+            "posted_at": raw_job.get("posted_date"),
+            "updated_at": raw_job.get("updated_time"),
+        },
+        full_text=full_text,
+        sections=[
+            make_section("description", heading="Description", text=description),
+            make_section("basic_qualifications", heading="Basic qualifications", text=basic_qualifications),
+            make_section("preferred_qualifications", heading="Preferred qualifications", text=preferred_qualifications),
+        ],
+        compensation=extract_amazon_compensation(preferred_qualifications, description),
+    )
+
+
 def build_job_detail_json(raw_job):
     """
     Build the detail JSON for GCS from the already fetched Amazon search entry.
     """
-    detail_payload = {key: raw_job.get(key) for key in JOB_DETAIL_KEYS}
+    detail_payload = build_job_detail_v1_from_json(raw_job)
     return json.dumps(detail_payload, ensure_ascii=False)
 
 

@@ -200,10 +200,7 @@ def make_job_detail(
         },
         "metadata": {
             "department": _clean_scalar(meta.get("department")),
-            "team": _clean_scalar(meta.get("team")),
-            "business_category": _clean_scalar(meta.get("business_category")),
-            "job_category": _clean_scalar(meta.get("job_category")),
-            "profession": _clean_scalar(meta.get("profession")),
+            "job_family": _clean_scalar(meta.get("job_family")),
             "role_type": _clean_scalar(meta.get("role_type")),
             "employment_type": _clean_scalar(meta.get("employment_type")),
             "job_type": _clean_scalar(meta.get("job_type")),

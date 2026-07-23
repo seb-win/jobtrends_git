@@ -7,6 +7,12 @@ import re
 from html import unescape
 from datetime import datetime, UTC
 
+from orchestrator.schemas.job_detail_v1 import (
+    build_full_text,
+    clean_text,
+    make_job_detail,
+    make_section,
+)
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -100,6 +106,92 @@ def format_time_ts(creation_ts_raw):
         creation_ts /= 1000
 
     return datetime.fromtimestamp(creation_ts, UTC).isoformat()
+
+
+def first_or_none(value):
+    if isinstance(value, list) and value:
+        return value[0]
+    return value
+
+
+def map_nvidia_section_name(heading):
+    normalized = (clean_text(heading) or "").casefold()
+    if "what you" in normalized and "doing" in normalized:
+        return "responsibilities"
+    if "what we need" in normalized:
+        return "requirements"
+    if "stand out" in normalized:
+        return "preferred_qualifications"
+    return None
+
+
+def extract_job_description_sections(job_description_html):
+    if not job_description_html:
+        return []
+
+    soup = BeautifulSoup(unescape(job_description_html), "html.parser")
+    sections = []
+    intro_parts = []
+
+    for child in soup.find_all(["p", "ul"], recursive=False):
+        if child.name != "p":
+            continue
+
+        heading_el = child.find("b")
+        heading = clean_text(heading_el.get_text(" ", strip=True)) if heading_el else None
+
+        if heading:
+            next_ul = child.find_next_sibling("ul")
+            items = []
+            if next_ul:
+                items = [
+                    clean_text(li.get_text(" ", strip=True))
+                    for li in next_ul.find_all("li", recursive=False)
+                ]
+                items = [item for item in items if item]
+
+            section = make_section(
+                map_nvidia_section_name(heading),
+                heading=heading,
+                text=next_ul.get_text(" ", strip=True) if next_ul else None,
+                items=items,
+            )
+            if section:
+                sections.append(section)
+        else:
+            text = clean_text(child.get_text(" ", strip=True))
+            if text:
+                intro_parts.append(text)
+
+    intro_text = build_full_text(*intro_parts)
+    if intro_text:
+        sections.insert(0, make_section("description", heading=None, text=intro_text))
+
+    return [section for section in sections if section]
+
+
+def build_job_detail_v1_from_json(detail_json):
+    data = detail_json.get("data", {}) if isinstance(detail_json, dict) else {}
+    job_description_html = data.get("jobDescription")
+    full_text = clean_text(job_description_html)
+    sections = extract_job_description_sections(job_description_html)
+
+    return make_job_detail(
+        job_id=data.get("id"),
+        title=data.get("name"),
+        company="NVIDIA",
+        metadata={
+            "department": data.get("department"),
+            "job_family": first_or_none(data.get("efcustomTextJobFmailyGroup")),
+            "employment_type": first_or_none(data.get("efcustomTextTimeType")),
+            "job_type": data.get("workLocationOption"),
+            "locations": data.get("locations") or data.get("location"),
+            "created_at": format_time_ts(data.get("creationTs")),
+            "posted_at": format_time_ts(data.get("postedTs")),
+        },
+        full_text=full_text,
+        sections=sections,
+    )
 
 
 def process_jobs(job_data, job_data_keys):
@@ -285,25 +377,8 @@ def update_master_list_with_jobs(jobs, master_list):
                 )
                 if response:
                     json_job = json.loads(response.text)
-                    job = json_job.get("data", {})
-
-                    html_text = job.get("jobDescription") or ""
-                    html_text = unescape(html_text)
-                    soup = BeautifulSoup(html_text, "html.parser")
-                    clean_text = soup.get_text(separator=" ", strip=True)
-                    clean_text = re.sub(r"\s+", " ", clean_text).strip()
-
-                    cleaned_job = {
-                        "creation_ts": format_time_ts(job.get("creationTs")),
-                        "posted_ts": format_time_ts(job.get("postedTs")),
-                        "department": job.get("department"),
-                        "id": job.get("id"),
-                        "job_description": clean_text,
-                        "location": job.get("location"),
-                        "name": job.get("name"),
-                    }
-
-                    json_string = json.dumps(cleaned_job, ensure_ascii=False)
+                    job_detail = build_job_detail_v1_from_json(json_job)
+                    json_string = json.dumps(job_detail, ensure_ascii=False)
 
                     upload_job_details_to_gcs(json_string, job_id, BUCKET_NAME, FOLDER_NAME)
 
