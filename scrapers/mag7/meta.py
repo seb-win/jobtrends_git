@@ -4,13 +4,13 @@ import psutil
 import json
 import re
 import html
+import requests
 from bs4 import BeautifulSoup
 
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
-    upload_job_details_to_gcs, upload_detailjob_json_to_gcs,
-    get_nested_value, send_metrics_to_cloud_function
+    upload_job_details_to_gcs, get_nested_value, send_metrics_to_cloud_function
 )
 
 # --------------------------------------
@@ -55,6 +55,34 @@ HEADERS = {
     'x-asbd-id': '129477',
     'x-fb-friendly-name': 'CareersJobSearchResultsQuery',
     'x-fb-lsd': 'AVqje43HUpw',
+}
+
+DETAIL_HEADERS = {
+    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+    'accept-language': 'de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7',
+    'cache-control': 'max-age=0',
+    'dpr': '1.25',
+    'priority': 'u=0, i',
+    'referer': 'https://www.metacareers.com/jobsearch/',
+    'sec-ch-prefers-color-scheme': 'light',
+    'sec-ch-ua': '"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"',
+    'sec-ch-ua-full-version-list': '"Not;A=Brand";v="8.0.0.0", "Chromium";v="150.0.7871.129", "Google Chrome";v="150.0.7871.129"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-model': '""',
+    'sec-ch-ua-platform': '"macOS"',
+    'sec-ch-ua-platform-version': '"14.6.1"',
+    'sec-fetch-dest': 'document',
+    'sec-fetch-mode': 'navigate',
+    'sec-fetch-site': 'same-origin',
+    'sec-fetch-user': '?1',
+    'upgrade-insecure-requests': '1',
+    'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
+    'viewport-width': '494',
+}
+
+DETAIL_COOKIES = {
+    'dpr': '1.25',
+    'wd': '494x794',
 }
 
 DAILY_JOB_URL = 'https://www.metacareers.com/graphql'
@@ -199,17 +227,6 @@ def extract_meta_job_detail_json_from_html(raw_html):
         if isinstance(detail, dict):
             return detail
 
-    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
-        raw = (script.string or script.get_text() or "").strip()
-        if not raw:
-            continue
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, dict) and payload.get("@type") == "JobPosting":
-            return payload
-
     return None
 
 
@@ -305,6 +322,29 @@ def build_job_detail_v1_from_json(node):
         },
         "compensation": compensation,
     }
+
+
+def fetch_job_detail_page(job_link):
+    return requests.get(
+        job_link,
+        headers=DETAIL_HEADERS,
+        cookies=DETAIL_COOKIES,
+        timeout=20,
+    )
+
+
+def upload_meta_detailjob_json_to_gcs(detail_obj, job_id):
+    json_filename = f"{FOLDER_NAME}_{job_id}.json"
+    upload_path = f"{FOLDER_NAME}/job_texts/{json_filename}"
+    storage_client = get_storage_client()
+    bucket = storage_client.bucket(BUCKET_NAME)
+    blob = bucket.blob(upload_path)
+    blob.upload_from_string(
+        json.dumps(detail_obj, ensure_ascii=False, indent=2),
+        content_type="application/json; charset=utf-8",
+        timeout=150,
+    )
+    return upload_path
 
 
 def process_jobs(job_data, job_data_keys):
@@ -469,28 +509,17 @@ def update_master_list_with_jobs(jobs, master_list):
             # Fetch job details from Meta's job_details route and upload structured detail JSON.
             job_link = DETAIL_JOB_URL_TEMPLATE.format(job_id=job['id'])
             if job_link:
-                response = fetch_url(
-                    job_link,
-                    headers=HEADERS,
-                    params=PARAMS,
-                    json=JSON_PAYLOAD,
-                    data=DATA,
-                    use_proxy=USE_PROXY_DETAILED_POSTINGS,
-                    max_retries=3,
-                    timeout=10,
-                    request_type=REQUEST_TYPE_SINGLE
-                )
+                response = fetch_job_detail_page(job_link)
+                response.raise_for_status()
                 if response:
                     try:
                         detail_json = extract_meta_job_detail_json_from_html(response.text)
                         if not isinstance(detail_json, dict):
                             raise ValueError("No Meta detail hydration payload found")
                         detail_model = build_job_detail_v1_from_json(detail_json)
-                        upload_detailjob_json_to_gcs(
+                        upload_meta_detailjob_json_to_gcs(
                             detail_model,
                             job_id,
-                            BUCKET_NAME,
-                            FOLDER_NAME,
                         )
                     except Exception as exc:
                         logging.warning(
