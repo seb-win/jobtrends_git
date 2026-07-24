@@ -1,8 +1,17 @@
 import logging
 import time
 import psutil
-from bs4 import BeautifulSoup
 import json
+import re
+from html.parser import HTMLParser
+
+from orchestrator.schemas.job_detail_v1 import (
+    build_full_text,
+    clean_text,
+    make_job_detail,
+    make_section,
+    map_section_name,
+)
 
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
@@ -80,6 +89,214 @@ JSON_PAYLOAD = {
     'searchText': '',
 }
 DATA = None
+
+
+class _CiscoDescriptionParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.blocks = []
+        self._tag_stack = []
+        self._current_tag = None
+        self._current_parts = []
+        self._current_list_items = None
+        self._current_li_parts = None
+
+    def handle_starttag(self, tag, attrs):
+        self._tag_stack.append(tag)
+        if tag in ("p", "h1", "h2", "h3", "h4") and self._current_tag is None:
+            self._current_tag = tag
+            self._current_parts = []
+        elif tag == "ul" and self._current_list_items is None:
+            self._current_list_items = []
+        elif tag == "li" and self._current_list_items is not None:
+            self._current_li_parts = []
+
+    def handle_endtag(self, tag):
+        if tag == self._current_tag:
+            text = clean_text(" ".join(self._current_parts))
+            self.blocks.append({"type": tag, "text": text})
+            self._current_tag = None
+            self._current_parts = []
+        elif tag == "li" and self._current_li_parts is not None:
+            item = clean_text(" ".join(self._current_li_parts))
+            if item:
+                self._current_list_items.append(item)
+            self._current_li_parts = None
+        elif tag == "ul" and self._current_list_items is not None:
+            self.blocks.append({"type": "ul", "items": self._current_list_items})
+            self._current_list_items = None
+
+        if tag in self._tag_stack:
+            self._tag_stack.remove(tag)
+
+    def handle_data(self, data):
+        if not data:
+            return
+        if self._current_li_parts is not None:
+            self._current_li_parts.append(data)
+        elif self._current_tag is not None:
+            self._current_parts.append(data)
+        elif not any(tag in self._tag_stack for tag in ("script", "style")):
+            text = clean_text(data)
+            if text:
+                self.blocks.append({"type": "text", "text": text})
+
+
+def map_cisco_section_name(heading):
+    normalized = (clean_text(heading) or "").casefold()
+    if "meet the team" in normalized:
+        return "about"
+    if "your impact" in normalized or "responsibilities" in normalized:
+        return "responsibilities"
+    if "why cisco" in normalized:
+        return "benefits"
+    if "message to applicants" in normalized:
+        return "compensation"
+    return map_section_name(heading)
+
+
+def extract_cisco_sections(job_description_html):
+    if not job_description_html:
+        return []
+
+    parser = _CiscoDescriptionParser()
+    parser.feed(job_description_html)
+    parser.close()
+    sections = []
+    intro_parts = []
+    current = None
+
+    def finish_current():
+        nonlocal current
+        if not current:
+            return
+
+        section = make_section(
+            current["name"],
+            heading=current["heading"],
+            text=build_full_text(*current["text_parts"]),
+            items=current["items"],
+        )
+        if section:
+            sections.append(section)
+        current = None
+
+    for block in parser.blocks:
+        block_type = block.get("type")
+
+        if block_type == "text":
+            text = block.get("text")
+            if text:
+                if current:
+                    current["text_parts"].append(text)
+                else:
+                    intro_parts.append(text)
+            continue
+
+        if block_type == "ul":
+            items = block.get("items") or []
+            if current:
+                current["items"].extend(items)
+            elif items:
+                current = {
+                    "name": "other",
+                    "heading": None,
+                    "text_parts": [],
+                    "items": items,
+                }
+            continue
+
+        if block_type not in ("p", "h1", "h2", "h3", "h4"):
+            continue
+
+        text = block.get("text")
+        heading = text if block_type in ("h1", "h2", "h3", "h4") else None
+
+        if heading and text == heading:
+            finish_current()
+            current = {
+                "name": map_cisco_section_name(heading),
+                "heading": heading,
+                "text_parts": [],
+                "items": [],
+            }
+            continue
+
+        if heading and text and text.startswith(heading):
+            finish_current()
+            remaining_text = clean_text(text[len(heading):])
+            current = {
+                "name": map_cisco_section_name(heading),
+                "heading": heading,
+                "text_parts": [remaining_text] if remaining_text else [],
+                "items": [],
+            }
+            continue
+
+        if text:
+            if current:
+                current["text_parts"].append(text)
+            else:
+                intro_parts.append(text)
+
+    finish_current()
+
+    intro_text = build_full_text(*intro_parts)
+    if intro_text:
+        sections.insert(0, make_section("description", heading=None, text=intro_text))
+
+    return [section for section in sections if section]
+
+
+def _extract_compensation(full_text):
+    if not full_text:
+        return None
+
+    salary_match = re.search(
+        r"The starting salary range posted for this position is\s*(\$[\d,]+(?:\.\d{2})?)\s*to\s*(\$[\d,]+(?:\.\d{2})?)",
+        full_text,
+        flags=re.IGNORECASE,
+    )
+    if not salary_match:
+        return None
+
+    raw = salary_match.group(0)
+    min_value = int(float(salary_match.group(1).replace("$", "").replace(",", "")))
+    max_value = int(float(salary_match.group(2).replace("$", "").replace(",", "")))
+
+    return {
+        "raw": raw,
+        "currency": "USD",
+        "min": min_value,
+        "max": max_value,
+        "period": "annual",
+        "text": raw,
+        "locale": "US",
+        "location_id": None,
+    }
+
+
+def build_job_detail_v1_from_json(detail_json):
+    job = detail_json.get("jobPostingInfo", {}) if isinstance(detail_json, dict) else {}
+    org = detail_json.get("hiringOrganization", {}) if isinstance(detail_json, dict) else {}
+    job_description_html = job.get("jobDescription")
+    full_text = clean_text(job_description_html, separator="\n")
+    locations = [job.get("location"), *(job.get("additionalLocations") or [])]
+
+    return make_job_detail(
+        job_id=job.get("jobReqId") or job.get("id"),
+        title=job.get("title"),
+        company=org.get("name") or "Cisco",
+        metadata={
+            "employment_type": job.get("timeType"),
+            "job_type": job.get("remoteType"),
+            "locations": locations,
+            "posted_at": job.get("startDate"),
+        },
+        full_text=full_text,
+        sections=extract_cisco_sections(job_description_html),
+        compensation=_extract_compensation(full_text),
+    )
 
 
 def process_jobs(job_data, job_data_keys):
@@ -258,8 +475,8 @@ def update_master_list_with_jobs(jobs, master_list):
                 )
                 if response:
                     json_job = (json.loads(response.text))
-                    job_info = json_job['jobPostingInfo']
-                    job_text = json.dumps(job_info)
+                    job_detail = build_job_detail_v1_from_json(json_job)
+                    job_text = json.dumps(job_detail, ensure_ascii=False)
                     upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
 
         processed_jobs_count += 1

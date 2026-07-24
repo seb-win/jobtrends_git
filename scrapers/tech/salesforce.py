@@ -10,6 +10,7 @@ from orchestrator.util_v2 import (
 )
 import time
 import psutil
+from orchestrator.schemas.job_detail_v1 import build_full_text, make_job_detail, make_section, map_section_name
 
 # --------------------------------------
 # Configuration and Constants
@@ -99,6 +100,194 @@ def clean_text(value):
     return text
 
 
+def _append_text_part(parts, value):
+    text = clean_text(value)
+    if text:
+        parts.append(text)
+
+
+def _section_heading_name(heading):
+    cleaned = clean_text(heading)
+    if not cleaned:
+        return None
+
+    normalized = cleaned.casefold()
+    if normalized == "impact":
+        return "responsibilities"
+    if normalized == "about salesforce":
+        return "about"
+    if normalized == "what kind of person will succeed":
+        return "qualifications"
+    if normalized == "posting statement":
+        return "equal_opportunity"
+    if normalized == "accommodations":
+        return "additional_information"
+    if normalized == "unleash your potential":
+        return "benefits"
+    if normalized == "job details":
+        return "description"
+    if normalized == "job category":
+        return "other"
+
+    return map_section_name(cleaned)
+
+
+def extract_job_description_sections(job_description_html):
+    if not job_description_html:
+        return []
+
+    soup = BeautifulSoup(html.unescape(job_description_html), "html.parser")
+    sections = []
+    current_heading = None
+    current_parts = []
+    current_items = []
+
+    def flush_section():
+        nonlocal current_heading, current_parts, current_items
+        if not current_heading:
+            current_parts = []
+            current_items = []
+            return
+
+        section = make_section(
+            _section_heading_name(current_heading),
+            heading=current_heading,
+            text=" ".join(current_parts) if current_parts else None,
+            items=current_items,
+        )
+        if section:
+            sections.append(section)
+
+        current_heading = None
+        current_parts = []
+        current_items = []
+
+    for node in soup.find_all(["p", "ul"]):
+        if node.name == "p":
+            heading_node = node.find("span", class_="emphasis-3")
+            bold_node = node.find("b")
+            paragraph_text = clean_text(node.get_text(" ", strip=True))
+
+            heading_text = clean_text(
+                heading_node.get_text(" ", strip=True) if heading_node else (
+                    bold_node.get_text(" ", strip=True) if bold_node and paragraph_text == clean_text(bold_node.get_text(" ", strip=True)) else None
+                )
+            )
+            if heading_text:
+                flush_section()
+                if heading_text.casefold() == "job category":
+                    current_heading = None
+                    current_parts = []
+                    current_items = []
+                    continue
+                current_heading = heading_text
+                remainder = paragraph_text[len(heading_text):].strip() if paragraph_text and paragraph_text.startswith(heading_text) else None
+                _append_text_part(current_parts, remainder)
+                continue
+
+            if bold_node:
+                bold_text = clean_text(bold_node.get_text(" ", strip=True))
+                if bold_text and paragraph_text and paragraph_text.endswith(bold_text):
+                    before_heading = paragraph_text[:-len(bold_text)].strip()
+                    _append_text_part(current_parts, before_heading)
+                    flush_section()
+                    current_heading = bold_text
+                    continue
+
+            _append_text_part(current_parts, paragraph_text)
+        elif node.name == "ul":
+            for item in node.find_all("li", recursive=False):
+                _append_text_part(current_items, item.get_text(" ", strip=True))
+
+    flush_section()
+    return sections
+
+
+def extract_job_category(job_description_html):
+    if not job_description_html:
+        return None
+
+    soup = BeautifulSoup(html.unescape(job_description_html), "html.parser")
+    for marker in soup.find_all("span", class_="emphasis-3"):
+        if clean_text(marker.get_text(" ", strip=True)) != "Job Category":
+            continue
+        parts = []
+        for sibling in marker.parent.next_siblings:
+            if getattr(sibling, "name", None) == "p":
+                break
+            _append_text_part(parts, sibling.get_text(" ", strip=True) if hasattr(sibling, "get_text") else sibling)
+        return clean_text(" ".join(parts))
+    return None
+
+
+def _salesforce_locations(job_posting_info):
+    locations = []
+    for value in [
+        job_posting_info.get("location"),
+        *(job_posting_info.get("additionalLocations") or []),
+    ]:
+        cleaned = clean_text(value)
+        if cleaned and cleaned not in locations:
+            locations.append(cleaned)
+    return locations
+
+
+def extract_compensation(full_text):
+    if not full_text:
+        return None
+
+    match = re.search(
+        r"(The typical base salary range for this position is \$([\d,]+)\s*-\s*\$([\d,]+)\s*annually)",
+        full_text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    raw = clean_text(match.group(1))
+    return {
+        "raw": raw,
+        "currency": "USD",
+        "min": int(match.group(2).replace(",", "")),
+        "max": int(match.group(3).replace(",", "")),
+        "period": "year",
+        "text": raw,
+        "locale": "US",
+        "location_id": None,
+    }
+
+
+def build_job_detail_v1_from_json(detail_json, fallback_title=None, fallback_location=None):
+    if not isinstance(detail_json, dict):
+        raise ValueError("Salesforce detail payload must be a dict")
+
+    job_posting_info = detail_json.get("jobPostingInfo")
+    if not isinstance(job_posting_info, dict):
+        job_posting_info = {}
+
+    job_description_html = job_posting_info.get("jobDescription")
+    full_text = build_full_text(job_description_html)
+    locations = _salesforce_locations(job_posting_info)
+    if not locations and fallback_location:
+        locations = [clean_text(fallback_location)]
+
+    return make_job_detail(
+        job_id=job_posting_info.get("jobReqId") or job_posting_info.get("id"),
+        title=job_posting_info.get("title") or fallback_title,
+        company="Salesforce",
+        metadata={
+            "job_family": extract_job_category(job_description_html),
+            "employment_type": job_posting_info.get("timeType"),
+            "job_type": job_posting_info.get("remoteType"),
+            "locations": locations,
+            "posted_at": job_posting_info.get("startDate"),
+        },
+        full_text=full_text,
+        sections=extract_job_description_sections(job_description_html),
+        compensation=extract_compensation(full_text),
+    )
+
+
 def build_workday_detail_url(job_link):
     """
     Convert the public Workday job URL from the daily JSON into the CXS JSON URL.
@@ -118,27 +307,22 @@ def build_workday_detail_url(job_link):
 
 
 def extract_job_details_from_detail_response(response, fallback_title=None, fallback_location=None):
-    """Extract selected fields from a Workday CXS detail response for GCS upload."""
+    """Build job_detail_v1 from a Workday CXS detail response for GCS upload."""
     try:
         detail_json = response.json()
     except ValueError:
-        return {
-            'title': clean_text(fallback_title),
-            'jobDescription': clean_text(response.text),
-            'posted': None,
-            'location': fallback_location,
-        }
+        return make_job_detail(
+            title=fallback_title,
+            company="Salesforce",
+            metadata={"locations": [fallback_location] if fallback_location else []},
+            full_text=response.text,
+        )
 
-    job_posting_info = get_nested_value(detail_json, ['jobPostingInfo'])
-    if not isinstance(job_posting_info, dict):
-        job_posting_info = {}
-
-    return {
-        'title': clean_text(job_posting_info.get('title') or fallback_title),
-        'jobDescription': clean_text(job_posting_info.get('jobDescription')),
-        'posted': job_posting_info.get('startDate'),
-        'location': job_posting_info.get('location') or fallback_location,
-    }
+    return build_job_detail_v1_from_json(
+        detail_json,
+        fallback_title=fallback_title,
+        fallback_location=fallback_location,
+    )
 
 def process_jobs(job_data, job_data_keys):
     """

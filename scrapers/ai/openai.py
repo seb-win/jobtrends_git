@@ -1,7 +1,12 @@
-import logging
+import html
+import json
 import time
+import logging
+import re
+
 import psutil
 from bs4 import BeautifulSoup
+from orchestrator.schemas.job_detail_v1 import build_full_text, clean_text, make_job_detail, make_section
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -89,6 +94,178 @@ JSON_PAYLOAD = {
     'query': 'query ApiJobBoardWithTeams($organizationHostedJobsPageName: String!) {\n  jobBoard: jobBoardWithTeams(\n    organizationHostedJobsPageName: $organizationHostedJobsPageName\n  ) {\n    teams {\n      id\n      name\n      parentTeamId\n      __typename\n    }\n    jobPostings {\n      id\n      title\n      teamId\n      locationId\n      locationName\n      workplaceType\n      employmentType\n      secondaryLocations {\n        ...JobPostingSecondaryLocationParts\n        __typename\n      }\n      compensationTierSummary\n      __typename\n    }\n    __typename\n  }\n}\n\nfragment JobPostingSecondaryLocationParts on JobPostingSecondaryLocation {\n  locationId\n  locationName\n  __typename\n}',
 }
 DATA = None
+
+
+def _canonical_section_name(heading):
+    heading_text = clean_text(heading)
+    if not heading_text:
+        return "other"
+
+    normalized = heading_text.casefold().rstrip(":")
+    if "about the team" in normalized or "about openai" in normalized:
+        return "about"
+    if "about the role" in normalized or "job description" in normalized:
+        return "description"
+    if "you might thrive" in normalized or "good fit" in normalized or "bonus point" in normalized:
+        return "qualifications"
+    if "in this role" in normalized or "what you'll do" in normalized or "what you’ll do" in normalized:
+        return "responsibilities"
+    if "location" in normalized:
+        return "additional_information"
+    if "equal opportunity" in normalized:
+        return "equal_opportunity"
+    if "compensation" in normalized or "base pay" in normalized or "benefit" in normalized:
+        return "compensation"
+    return "other"
+
+
+def _html_to_sections(html_text):
+    if not html_text:
+        return []
+
+    soup = BeautifulSoup(html.unescape(str(html_text)), "html.parser")
+    sections = []
+    current = {"name": "description", "heading": None, "text_parts": [], "items": []}
+
+    def flush_current():
+        section = make_section(
+            current["name"],
+            heading=current["heading"],
+            text=build_full_text(*current["text_parts"]),
+            items=current["items"],
+        )
+        if section:
+            sections.append(section)
+
+    for element in soup.find_all(["p", "li"], recursive=True):
+        if element.name != "li" and element.find_parent("li"):
+            continue
+
+        text = clean_text(element.get_text(" ", strip=True))
+        if not text:
+            continue
+
+        strong = element.find("strong")
+        strong_text = clean_text(strong.get_text(" ", strip=True)) if strong else None
+        is_heading = bool(strong_text and text == strong_text)
+
+        if text.startswith("We are an equal opportunity employer"):
+            flush_current()
+            current = {
+                "name": "equal_opportunity",
+                "heading": None,
+                "text_parts": [text],
+                "items": [],
+            }
+            continue
+
+        if is_heading or (element.name == "p" and text in {
+            "About The Team",
+            "About The Role",
+            "What You’ll Do",
+            "You Might Be A Good Fit If You",
+            "Bonus Points",
+        }):
+            flush_current()
+            heading = strong_text or text
+            current = {
+                "name": _canonical_section_name(heading),
+                "heading": heading.rstrip(":"),
+                "text_parts": [],
+                "items": [],
+            }
+            continue
+
+        if element.name == "li":
+            current["items"].append(text)
+        else:
+            current["text_parts"].append(text)
+
+    flush_current()
+    return sections
+
+
+def _extract_locations(job_posting):
+    locations = []
+    for value in [job_posting.get("locationName"), *(job_posting.get("secondaryLocationNames") or [])]:
+        text = clean_text(value)
+        if text and text not in locations:
+            locations.append(text)
+    return locations
+
+
+def _extract_compensation(job_posting):
+    summary = clean_text(job_posting.get("compensationTierSummary"))
+    salary_summary = clean_text(job_posting.get("scrapeableCompensationSalarySummary"))
+    philosophy = clean_text(job_posting.get("compensationPhilosophyHtml"))
+    text = build_full_text(summary, philosophy)
+
+    min_value = max_value = None
+    source = salary_summary or summary
+    if source:
+        values = []
+        for value, suffix in re.findall(r"\$\s*([0-9]+(?:\.[0-9]+)?)\s*([KkMm]?)", source):
+            number = float(value)
+            if suffix.casefold() == "k":
+                number *= 1000
+            elif suffix.casefold() == "m":
+                number *= 1000000
+            values.append(int(number))
+        if values:
+            min_value = values[0]
+            max_value = values[1] if len(values) > 1 else None
+
+    return {
+        "raw": summary or salary_summary,
+        "currency": "USD" if source and "$" in source else None,
+        "min": min_value,
+        "max": max_value,
+        "period": "year" if min_value is not None else None,
+        "text": text,
+        "locale": "US" if source and "$" in source else None,
+        "location_id": None,
+    }
+
+
+def build_job_detail_v1_from_json(detail_json):
+    job_posting = get_nested_value(detail_json, ["data", "jobPosting"]) or detail_json.get("jobPosting") or detail_json
+    description_html = job_posting.get("descriptionHtml")
+    compensation_html = job_posting.get("compensationPhilosophyHtml")
+
+    sections = _html_to_sections(description_html)
+    compensation_section = make_section(
+        "compensation",
+        heading="Compensation",
+        text=build_full_text(job_posting.get("compensationTierSummary"), compensation_html),
+    )
+    if compensation_section:
+        sections.append(compensation_section)
+
+    team_names = job_posting.get("teamNames") or []
+    job_family = clean_text(team_names[0]) if team_names else clean_text(job_posting.get("departmentExternalName") or job_posting.get("departmentName"))
+    department = clean_text(team_names[-1]) if len(team_names) > 1 else clean_text(job_posting.get("departmentName"))
+
+    return make_job_detail(
+        job_id=job_posting.get("id"),
+        title=job_posting.get("title"),
+        company="OpenAI",
+        metadata={
+            "department": department,
+            "job_family": job_family,
+            "employment_type": job_posting.get("employmentType"),
+            "job_type": job_posting.get("workplaceType"),
+            "locations": _extract_locations(job_posting),
+            "updated_at": job_posting.get("applicationDeadline"),
+        },
+        full_text=build_full_text(description_html, compensation_html, job_posting.get("applicationLimitCalloutHtml")),
+        sections=sections,
+        compensation=_extract_compensation(job_posting),
+    )
+
+
+def build_job_detail_json(detail_json):
+    return json.dumps(build_job_detail_v1_from_json(detail_json), ensure_ascii=False, indent=2)
+
 
 def decode_teams(teams_id, teams):
     for team in teams:
@@ -282,9 +459,13 @@ def update_master_list_with_jobs(jobs, master_list):
                     request_type=REQUEST_TYPE_SINGLE
                 )
                 if response:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    job_text = soup.get_text()
-                    upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
+                    try:
+                        detail_json = response.json()
+                    except ValueError as e:
+                        logging.error(f"Failed to parse job detail JSON for {job_id}: {e}")
+                        continue
+                    job_detail = build_job_detail_json(detail_json)
+                    upload_job_details_to_gcs(job_detail, job_id, BUCKET_NAME, FOLDER_NAME)
 
     # Mark old jobs as inactive
     for entry in master_list:

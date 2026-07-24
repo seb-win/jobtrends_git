@@ -104,6 +104,141 @@ def clean_html(text: str) -> str:
     return cleaned
 
 
+def _section_name_from_heading(heading):
+    heading_key = re.sub(r"[^a-z0-9]+", " ", (heading or "").lower()).strip()
+    mapping = {
+        "about the role": "description",
+        "what youll do": "responsibilities",
+        "what you ll do": "responsibilities",
+        "what you will do": "responsibilities",
+        "what youll need": "qualifications",
+        "what you ll need": "qualifications",
+        "strong candidates may also have": "preferred_qualifications",
+        "compensation": "compensation",
+        "working at runway": "about",
+    }
+    return mapping.get(heading_key, "other")
+
+
+def _clean_node_text(node):
+    if not node:
+        return None
+    text = unescape(node.get_text(" ", strip=True))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or None
+
+
+def extract_sections_from_description_html(description_html):
+    if not description_html:
+        return []
+
+    soup = BeautifulSoup(unescape(description_html), "html.parser")
+    sections = []
+    current_section = {
+        "name": "description",
+        "heading": None,
+        "text_parts": [],
+        "items": [],
+    }
+
+    def flush_section():
+        text = " ".join(part for part in current_section["text_parts"] if part)
+        text = re.sub(r"\s+", " ", text).strip() or None
+        if current_section["heading"] or text or current_section["items"]:
+            sections.append({
+                "name": current_section["name"],
+                "heading": current_section["heading"],
+                "text": text,
+                "items": current_section["items"],
+            })
+
+    for node in soup.find_all(["p", "h1", "h2", "h3", "ul", "ol"], recursive=False):
+        if node.name in ("h1", "h2", "h3"):
+            flush_section()
+            heading = _clean_node_text(node)
+            current_section = {
+                "name": _section_name_from_heading(heading),
+                "heading": heading,
+                "text_parts": [],
+                "items": [],
+            }
+        elif node.name in ("ul", "ol"):
+            items = [_clean_node_text(item) for item in node.find_all("li", recursive=False)]
+            current_section["items"].extend(item for item in items if item)
+        else:
+            text = _clean_node_text(node)
+            if text:
+                if (
+                    current_section["name"] != "compensation"
+                    and text.startswith("Runway strives to recruit and retain exceptional talent")
+                ):
+                    flush_section()
+                    current_section = {
+                        "name": "compensation",
+                        "heading": None,
+                        "text_parts": [],
+                        "items": [],
+                    }
+                current_section["text_parts"].append(text)
+
+    flush_section()
+    return sections
+
+
+def build_job_detail_v1_from_json(json_job):
+    job_root = (json_job or {}).get("data", {}).get("jobPosting", {})
+    description_html = job_root.get("descriptionHtml")
+    secondary_locations = job_root.get("secondaryLocationNames") or []
+    locations = []
+    for location in [job_root.get("locationName"), *secondary_locations]:
+        if location and location not in locations:
+            locations.append(location)
+
+    compensation_raw = (
+        job_root.get("compensationTierSummary")
+        or job_root.get("scrapeableCompensationSalarySummary")
+    )
+    compensation_text = job_root.get("scrapeableCompensationSalarySummary") or compensation_raw
+
+    return {
+        "schema_version": "job_detail_v1",
+        "job": {
+            "id": job_root.get("id"),
+            "title": job_root.get("title"),
+            "company": "Runway",
+        },
+        "metadata": {
+            "department": job_root.get("departmentExternalName") or job_root.get("departmentName"),
+            "job_family": None,
+            "role_type": None,
+            "employment_type": job_root.get("employmentType"),
+            "job_type": job_root.get("workplaceType"),
+            "career_level": None,
+            "experience_level": None,
+            "required_travel": None,
+            "locations": locations,
+            "created_at": None,
+            "posted_at": None,
+            "updated_at": None,
+        },
+        "content": {
+            "full_text": clean_html(description_html) or None,
+            "full_text_truncated": False,
+            "sections": extract_sections_from_description_html(description_html),
+        },
+        "compensation": {
+            "raw": compensation_raw,
+            "currency": None,
+            "min": None,
+            "max": None,
+            "period": None,
+            "text": compensation_text,
+            "locale": None,
+            "location_id": None,
+        },
+    }
+
+
 def build_team_id_lookup(team_list):
     return {
         team['id']: team['name']
@@ -319,18 +454,7 @@ def update_master_list_with_jobs(jobs, master_list, team_list):
                 )
                 if response:
                     json_job = json.loads(response.text)
-                    job_root = json_job.get("data", {}).get("jobPosting", {})
-                    job_text_dict = {
-                        "title": job_root.get("title"),
-                        "id": job_root.get("id"),
-                        "departmentName": job_root.get("departmentName"),
-                        "locationName": job_root.get("locationName"),
-                        "workplaceType": job_root.get("workplaceType"),
-                        "description": clean_html(job_root.get("descriptionHtml")),
-                        "salary": job_root.get("scrapeableCompensationSalarySummary"),
-                        "employmentType": job_root.get("employmentType"),
-                    }
-
+                    job_text_dict = build_job_detail_v1_from_json(json_job)
                     job_text = json.dumps(job_text_dict, ensure_ascii=False)
                     upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
 

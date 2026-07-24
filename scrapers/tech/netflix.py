@@ -1,7 +1,10 @@
+import html as html_lib
+from html.parser import HTMLParser
+import json
 import logging
+import re
 import time
 import psutil
-from bs4 import BeautifulSoup
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -80,6 +83,213 @@ PARAMS = [
 JSON_PAYLOAD = None
 DATA = None
 
+
+
+
+class JobDescriptionParser(HTMLParser):
+    BLOCK_TAGS = {'p', 'div', 'li', 'br', 'h1', 'h2', 'h3'}
+    HEADING_TAGS = {'h1', 'h2', 'h3'}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.text_parts = []
+        self.sections = []
+        self.current = self.new_section('description', None)
+        self.tag_stack = []
+        self.capture_tag = None
+        self.capture_parts = []
+        self.li_parts = []
+
+    @staticmethod
+    def new_section(name, heading):
+        return {'name': name, 'heading': heading, 'text_parts': [], 'items': []}
+
+    def handle_starttag(self, tag, attrs):
+        self.tag_stack.append(tag)
+        if tag in self.BLOCK_TAGS:
+            self.text_parts.append(' ')
+        if tag == 'li':
+            self.li_parts = []
+        if tag in self.HEADING_TAGS or (tag in {'strong', 'b'} and self.capture_tag is None):
+            self.capture_tag = tag
+            self.capture_parts = []
+
+    def handle_endtag(self, tag):
+        if tag in self.BLOCK_TAGS:
+            self.text_parts.append(' ')
+        if self.capture_tag == tag:
+            heading = normalize_text(' '.join(self.capture_parts))
+            if heading and (tag in self.HEADING_TAGS or self.is_standalone_heading(heading)):
+                self.flush_current()
+                self.current = self.new_section(section_name_for_heading(heading), heading)
+            self.capture_tag = None
+            self.capture_parts = []
+        if tag == 'li':
+            item = normalize_text(' '.join(self.li_parts))
+            if item:
+                self.current['items'].append(item)
+            self.li_parts = []
+        if tag in self.tag_stack:
+            self.tag_stack = self.tag_stack[:len(self.tag_stack) - 1 - self.tag_stack[::-1].index(tag)]
+
+    def handle_data(self, data):
+        self.text_parts.append(data)
+        if self.capture_tag:
+            self.capture_parts.append(data)
+        if self.inside_tag('li'):
+            self.li_parts.append(data)
+        elif not self.capture_tag:
+            self.current['text_parts'].append(data)
+
+    def inside_tag(self, tag):
+        return tag in self.tag_stack
+
+    def is_standalone_heading(self, heading):
+        return len(heading) <= 80 and not self.inside_tag('p') and not self.inside_tag('li')
+
+    def flush_current(self):
+        text = normalize_text(' '.join(self.current['text_parts']))
+        if text or self.current['items']:
+            self.sections.append({
+                'name': self.current['name'],
+                'heading': self.current['heading'],
+                'text': text,
+                'items': self.current['items']
+            })
+
+    def finish(self):
+        self.flush_current()
+        return normalize_text(' '.join(self.text_parts)), self.sections
+
+
+def normalize_text(value):
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        value = str(value)
+    text = html_lib.unescape(value)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text or None
+
+
+def parse_job_description_html(value):
+    if value is None:
+        return None, []
+    parser = JobDescriptionParser()
+    parser.feed(str(value))
+    parser.close()
+    return parser.finish()
+
+
+def clean_text(value):
+    """Return normalized plain text from HTML or text fragments."""
+    return normalize_text(value)
+
+
+def first_custom_field(detail, field_name):
+    values = get_nested_value(detail, ['custom_JD', 'data_fields', field_name])
+    if isinstance(values, list):
+        return values[0] if values else None
+    return values
+
+
+def unix_timestamp_to_date(value):
+    if not value:
+        return None
+    try:
+        return time.strftime('%Y-%m-%d', time.gmtime(int(value)))
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def section_name_for_heading(heading):
+    normalized = (heading or '').lower()
+    if 'responsib' in normalized:
+        return 'responsibilities'
+    if 'qualification' in normalized or 'skills and experience' in normalized:
+        return 'qualifications'
+    if normalized in {'role', 'our team'} or 'team' in normalized:
+        return 'about'
+    if 'value' in normalized:
+        return 'preferred_qualifications'
+    if 'compensation' in normalized or 'salary' in normalized or 'benefit' in normalized:
+        return 'compensation'
+    if 'inclusion' in normalized or 'equal' in normalized or 'diversity' in normalized:
+        return 'equal_opportunity'
+    return 'other'
+
+
+def extract_sections_from_html(html):
+    return parse_job_description_html(html)[1]
+
+def extract_compensation(full_text):
+    compensation = {
+        'raw': None,
+        'currency': None,
+        'min': None,
+        'max': None,
+        'period': None,
+        'text': None,
+        'locale': None,
+        'location_id': None
+    }
+    if not full_text:
+        return compensation
+
+    match = re.search(r'(?:range for this role is\s*)?(\$[\d,]+(?:\.\d{2})?)\s*-\s*(\$[\d,]+(?:\.\d{2})?)', full_text)
+    if not match:
+        return compensation
+
+    def money_to_float(value):
+        return float(value.replace('$', '').replace(',', ''))
+
+    compensation.update({
+        'raw': match.group(0),
+        'currency': 'USD',
+        'min': money_to_float(match.group(1)),
+        'max': money_to_float(match.group(2)),
+        'period': 'year',
+        'text': match.group(0),
+        'locale': 'en-US'
+    })
+    return compensation
+
+
+def build_job_detail_v1_from_json(detail):
+    locations = detail.get('locations')
+    if not isinstance(locations, list):
+        locations = [detail.get('location')] if detail.get('location') else []
+
+    full_text, sections = parse_job_description_html(detail.get('job_description'))
+    return {
+        'schema_version': 'job_detail_v1',
+        'job': {
+            'id': str(detail.get('id')) if detail.get('id') is not None else first_custom_field(detail, 'job_req_id'),
+            'title': detail.get('posting_name') or detail.get('name'),
+            'company': 'Netflix'
+        },
+        'metadata': {
+            'department': detail.get('department') or first_custom_field(detail, 'team'),
+            'job_family': detail.get('business_unit'),
+            'role_type': None,
+            'employment_type': None,
+            'job_type': first_custom_field(detail, 'work_type'),
+            'career_level': None,
+            'experience_level': None,
+            'required_travel': None,
+            'locations': [clean_text(location) for location in locations if clean_text(location)],
+            'created_at': unix_timestamp_to_date(detail.get('t_create')),
+            'posted_at': first_custom_field(detail, 'posting_date'),
+            'updated_at': unix_timestamp_to_date(detail.get('t_update'))
+        },
+        'content': {
+            'full_text': full_text,
+            'full_text_truncated': False,
+            'sections': sections
+        },
+        'compensation': extract_compensation(full_text)
+    }
 
 def process_jobs(job_data, job_data_keys):
     """
@@ -257,9 +467,14 @@ def update_master_list_with_jobs(jobs, master_list):
                     request_type=REQUEST_TYPE_SINGLE
                 )
                 if response:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    job_text = soup.get_text()
-                    upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
+                    try:
+                        detail_data = response.json()
+                    except ValueError as e:
+                        logging.error(f"Failed to parse job detail JSON for {job_id}: {e}")
+                    else:
+                        job_detail = build_job_detail_v1_from_json(detail_data)
+                        job_text = json.dumps(job_detail, ensure_ascii=False)
+                        upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
 
     # Mark old jobs as inactive
     for entry in master_list:

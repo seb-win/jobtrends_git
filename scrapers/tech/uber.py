@@ -1,7 +1,16 @@
+import json
 import logging
+import re
 import time
 import psutil
 from bs4 import BeautifulSoup
+from orchestrator.schemas.job_detail_v1 import (
+    build_full_text,
+    clean_text,
+    make_job_detail,
+    make_section,
+    map_section_name,
+)
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -68,6 +77,229 @@ JOB_DATA_KEYS = {
     'description': ['description']
 }
 
+
+def _location_values(raw_job):
+    locations = raw_job.get('Locations')
+    if isinstance(locations, list):
+        values = []
+        for location in locations:
+            if not isinstance(location, dict):
+                continue
+            value = location.get('Address') or ', '.join(
+                part for part in (
+                    location.get('City'),
+                    location.get('Region'),
+                    location.get('Country'),
+                )
+                if part
+            )
+            if value:
+                values.append(value)
+        return values
+
+    location = raw_job.get('location')
+    if isinstance(location, dict):
+        value = location.get('city') or location.get('name')
+        return [value] if value else []
+
+    return [location] if location else []
+
+
+def _first_team(raw_job):
+    teams = raw_job.get('Teams')
+    if isinstance(teams, list) and teams:
+        return teams[0]
+    return raw_job.get('team')
+
+
+def _split_additional_text(raw_job):
+    additional_text = clean_text(raw_job.get('AdditionalText'))
+    team = clean_text(_first_team(raw_job))
+    if not additional_text:
+        return None, team
+
+    if team and additional_text.startswith(team):
+        remainder = clean_text(additional_text[len(team):])
+        return remainder, team
+
+    return additional_text, team
+
+
+def _uber_section_name(heading):
+    normalized = clean_text(heading)
+    if not normalized:
+        return 'other'
+
+    normalized = normalized.casefold().replace('’', "'")
+    if normalized.startswith('about the role and team') or normalized.startswith('about the team'):
+        return 'about'
+    if normalized.startswith('about the role') or normalized.startswith('about the job'):
+        return 'description'
+    if "what you'll do" in normalized or 'what you will do' in normalized:
+        return 'responsibilities'
+    if normalized == 'ready to ride?':
+        return 'additional_information'
+
+    return map_section_name(heading)
+
+
+def _paragraph_section_name(text):
+    normalized = clean_text(text)
+    if not normalized:
+        return None
+
+    normalized = normalized.casefold()
+    if 'base salary range' in normalized or 'bonus program' in normalized:
+        return 'compensation'
+    if 'equal opportunity employer' in normalized:
+        return 'equal_opportunity'
+    if normalized.startswith('offices remain key'):
+        return 'additional_information'
+    return None
+
+
+def _extract_description_sections(description_html):
+    if not description_html:
+        return []
+
+    soup = BeautifulSoup(description_html, 'html.parser')
+    sections = []
+    current = None
+
+    for element in soup.find_all(['p', 'ul'], recursive=False):
+        if element.name == 'p':
+            strong = element.find('strong')
+            heading = clean_text(strong.get_text(' ', strip=True)) if strong else None
+            paragraph_text = clean_text(element.get_text(' ', strip=True))
+
+            if heading and paragraph_text == heading:
+                current = {
+                    'name': _uber_section_name(heading),
+                    'heading': heading,
+                    'text_parts': [],
+                    'items': [],
+                }
+                sections.append(current)
+                continue
+
+            if paragraph_text:
+                paragraph_section_name = _paragraph_section_name(paragraph_text)
+                if paragraph_section_name:
+                    if current and current['name'] == paragraph_section_name and current['heading'] is None:
+                        current['text_parts'].append(paragraph_text)
+                    else:
+                        current = {
+                            'name': paragraph_section_name,
+                            'heading': None,
+                            'text_parts': [paragraph_text],
+                            'items': [],
+                        }
+                        sections.append(current)
+                    continue
+
+                if current is None:
+                    current = {
+                        'name': 'description',
+                        'heading': None,
+                        'text_parts': [],
+                        'items': [],
+                    }
+                    sections.append(current)
+                current['text_parts'].append(paragraph_text)
+
+        elif element.name == 'ul':
+            items = [clean_text(li.get_text(' ', strip=True)) for li in element.find_all('li', recursive=False)]
+            items = [item for item in items if item]
+            if items:
+                if current is None:
+                    current = {
+                        'name': 'other',
+                        'heading': None,
+                        'text_parts': [],
+                        'items': [],
+                    }
+                    sections.append(current)
+                current['items'].extend(items)
+
+    return [
+        make_section(
+            section['name'],
+            heading=section['heading'],
+            text='\n'.join(section['text_parts']) if section['text_parts'] else None,
+            items=section['items'],
+        )
+        for section in sections
+    ]
+
+
+def _extract_compensation(raw_job):
+    salary = raw_job.get('Salary')
+    if not isinstance(salary, dict):
+        return {}
+
+    description = salary.get('Description')
+    text = clean_text(description)
+    compensation = {
+        'raw': text,
+        'currency': salary.get('Currency'),
+        'min': salary.get('MinValue'),
+        'max': salary.get('MaxValue'),
+        'period': salary.get('Period'),
+        'text': text,
+    }
+
+    if text:
+        matches = re.findall(r'([A-Z]{3})\s+\$([0-9,]+)\s+per\s+year\s+-\s+([A-Z]{3})\s+\$([0-9,]+)\s+per\s+year', text)
+        if matches:
+            currencies = {match[0] for match in matches} | {match[2] for match in matches}
+            mins = [int(match[1].replace(',', '')) for match in matches]
+            maxes = [int(match[3].replace(',', '')) for match in matches]
+            if len(currencies) == 1:
+                compensation['currency'] = currencies.pop()
+            compensation['min'] = min(mins)
+            compensation['max'] = max(maxes)
+            compensation['period'] = 'year'
+
+    return compensation
+
+
+def build_job_detail_v1_from_json(raw_job):
+    """
+    Build job_detail_v1 from the already aggregated Uber list entry.
+
+    Uber's list API contains the detail description and metadata used here, so this
+    function intentionally performs no standalone detail fetch.
+    """
+    job_family, department = _split_additional_text(raw_job)
+    description = raw_job.get('Description') or raw_job.get('description')
+    salary = raw_job.get('Salary') if isinstance(raw_job.get('Salary'), dict) else {}
+    salary_description = salary.get('Description')
+    full_text = build_full_text(description, salary_description)
+
+    return make_job_detail(
+        job_id=raw_job.get('Id') or raw_job.get('Reference') or raw_job.get('id'),
+        title=raw_job.get('Title') or raw_job.get('title'),
+        company='Uber',
+        metadata={
+            'department': department,
+            'job_family': job_family,
+            'employment_type': raw_job.get('ContractType') or raw_job.get('timeType'),
+            'job_type': 'Remote' if raw_job.get('Remote') is True else raw_job.get('WorkPattern'),
+            'experience_level': raw_job.get('ExperienceLevel'),
+            'locations': _location_values(raw_job),
+            'posted_at': raw_job.get('DisplayDate'),
+        },
+        full_text=full_text,
+        sections=_extract_description_sections(description),
+        compensation=_extract_compensation(raw_job),
+    )
+
+
+def build_job_detail_json(raw_job):
+    detail_payload = build_job_detail_v1_from_json(raw_job)
+    return json.dumps(detail_payload, ensure_ascii=False)
+
+
 extraction_logic = {
     # If any specific fields need special handling, define them here.
 }
@@ -96,7 +328,8 @@ def process_jobs(job_data, job_data_keys):
             'scraping_date': None,
             'last_updated': None,
             'status': None,
-            'keywords': []
+            'keywords': [],
+            '_raw_job': listing
         }
 
         for key, path in job_data_keys.items():
@@ -228,26 +461,14 @@ def update_master_list_with_jobs(jobs, master_list):
             new_jobs_count += 1
 
             # Fetch job details if a link is provided
-            # job_link = job.get('link')
-            # if job_link:
-            #     response = fetch_url(
-            #         job_link,
-            #         headers=HEADERS,
-            #         params=PARAMS,
-            #         json=JSON_PAYLOAD,
-            #         data=DATA,
-            #         use_proxy=USE_PROXY_DETAILED_POSTINGS,
-            #         max_retries=3,
-            #         timeout=10,
-            #         request_type=REQUEST_TYPE_SINGLE
-            #     )
-            #     if response:
-            #         soup = BeautifulSoup(response.text, 'html.parser')
-            #         job_text = soup.get_text()
-            #         upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
+            raw_job = job.get('_raw_job')
+            if raw_job:
+                job_detail = build_job_detail_json(raw_job)
+                upload_job_details_to_gcs(job_detail, job_id, BUCKET_NAME, FOLDER_NAME)
 
     # Mark old jobs as inactive
     for entry in master_list:
+        entry.pop('_raw_job', None)
         if entry['last_updated'] != current_date:
             entry['status'] = 'inactive'
             inactive_jobs_count += 1

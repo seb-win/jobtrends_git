@@ -3,7 +3,10 @@ import time
 import psutil
 from bs4 import BeautifulSoup
 import json
+import html
+import re
 
+from orchestrator.schemas.job_detail_v1 import build_full_text, clean_text, make_job_detail, make_section, map_section_name
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -218,10 +221,161 @@ def fetch_all_jobs():
 
     return all_jobs
 
-def html_to_text(html):
-    if not html:
-        return None
-    return BeautifulSoup(html, "html.parser").get_text(separator="\n", strip=True)
+def _perplexity_section_name(heading):
+    heading_text = clean_text(heading)
+    if not heading_text:
+        return "other"
+
+    normalized = heading_text.casefold().rstrip(":")
+    if normalized == "why perplexity is different":
+        return "about"
+    if normalized == "qualifications":
+        return "qualifications"
+    if normalized in {"bonus", "nice to have"}:
+        return "preferred_qualifications"
+    return map_section_name(heading_text)
+
+
+def _html_to_sections(html_text):
+    if not html_text:
+        return []
+
+    soup = BeautifulSoup(html.unescape(str(html_text)), "html.parser")
+    sections = []
+    current = {"name": "description", "heading": None, "text_parts": [], "items": []}
+
+    def flush_current():
+        section = make_section(
+            current["name"],
+            heading=current["heading"],
+            text=build_full_text(*current["text_parts"]),
+            items=current["items"],
+        )
+        if section:
+            sections.append(section)
+
+    for element in soup.find_all(["h1", "h2", "h3", "h4", "p", "li"], recursive=True):
+        if element.name != "li" and element.find_parent("li"):
+            continue
+
+        text = clean_text(element.get_text(" ", strip=True))
+        if not text:
+            continue
+
+        strong = element.find("strong")
+        strong_text = clean_text(strong.get_text(" ", strip=True)) if strong else None
+        is_structural_heading = element.name in {"h1", "h2", "h3", "h4"}
+        is_standalone_bold_heading = element.name == "p" and strong_text and text == strong_text
+
+        if is_structural_heading or is_standalone_bold_heading:
+            flush_current()
+            heading = text.rstrip(":")
+            current = {
+                "name": _perplexity_section_name(heading),
+                "heading": heading,
+                "text_parts": [],
+                "items": [],
+            }
+            continue
+
+        if element.name == "li":
+            current["items"].append(text)
+        else:
+            current["text_parts"].append(text)
+
+    flush_current()
+    return sections
+
+
+def _extract_locations(job_posting):
+    locations = []
+    for value in [job_posting.get("locationName"), *(job_posting.get("secondaryLocationNames") or [])]:
+        text = clean_text(value)
+        if text and text not in locations:
+            locations.append(text)
+    return locations
+
+
+def _parse_salary_range(text):
+    cleaned = clean_text(text)
+    if not cleaned:
+        return None, None, None
+
+    match = re.search(r"([$€£])\s*([\d,.]+)\s*([Kk]?)\s*[-–]\s*([$€£])?\s*([\d,.]+)\s*([Kk]?)", cleaned)
+    if not match:
+        return None, None, None
+
+    currency_symbol = match.group(1)
+    min_value = float(match.group(2).replace(",", ""))
+    max_value = float(match.group(5).replace(",", ""))
+    if match.group(3).casefold() == "k":
+        min_value *= 1000
+    if match.group(6).casefold() == "k":
+        max_value *= 1000
+
+    currency = {"$": "USD", "€": "EUR", "£": "GBP"}.get(currency_symbol)
+    return currency, int(min_value), int(max_value)
+
+
+def _extract_compensation(job_posting):
+    summary = clean_text(job_posting.get("compensationTierSummary"))
+    salary_summary = clean_text(job_posting.get("scrapeableCompensationSalarySummary"))
+    philosophy = clean_text(job_posting.get("compensationPhilosophyHtml"))
+    text = build_full_text(summary, salary_summary, philosophy)
+    currency, min_value, max_value = _parse_salary_range(salary_summary or summary)
+
+    return {
+        "raw": summary or salary_summary,
+        "currency": currency,
+        "min": min_value,
+        "max": max_value,
+        "period": "year" if min_value is not None and max_value is not None else None,
+        "text": text,
+        "locale": "US" if currency == "USD" else None,
+        "location_id": None,
+    }
+
+
+def build_job_detail_v1_from_json(detail_json):
+    job_posting = get_nested_value(detail_json, ["data", "jobPosting"]) or detail_json.get("jobPosting") or detail_json
+    description_html = job_posting.get("descriptionHtml")
+    compensation_html = job_posting.get("compensationPhilosophyHtml")
+
+    sections = _html_to_sections(description_html)
+    compensation_section = make_section(
+        "compensation",
+        heading="Compensation",
+        text=build_full_text(job_posting.get("compensationTierSummary"), job_posting.get("scrapeableCompensationSalarySummary"), compensation_html),
+    )
+    if compensation_section:
+        sections.append(compensation_section)
+
+    team_names = job_posting.get("teamNames") or []
+    department = clean_text(team_names[-1]) if team_names else clean_text(job_posting.get("departmentName"))
+    job_family = clean_text(job_posting.get("departmentExternalName") or job_posting.get("departmentName"))
+    if department == job_family:
+        job_family = None
+
+    return make_job_detail(
+        job_id=job_posting.get("id"),
+        title=job_posting.get("title"),
+        company="Perplexity",
+        metadata={
+            "department": department,
+            "job_family": job_family,
+            "employment_type": job_posting.get("employmentType"),
+            "job_type": job_posting.get("workplaceType"),
+            "locations": _extract_locations(job_posting),
+            "updated_at": job_posting.get("applicationDeadline"),
+        },
+        full_text=build_full_text(description_html, compensation_html, job_posting.get("applicationLimitCalloutHtml")),
+        sections=sections,
+        compensation=_extract_compensation(job_posting),
+    )
+
+
+def build_job_detail_json(detail_json):
+    return json.dumps(build_job_detail_v1_from_json(detail_json), ensure_ascii=False, indent=2)
 
 
 
@@ -280,35 +434,13 @@ def update_master_list_with_jobs(jobs, master_list):
                     request_type=REQUEST_TYPE_SINGLE
                 )
                 if response:
-                    json_rep = json.loads(response.text)
-                    job = json_rep.get("data", {}).get("jobPosting", {})
-
-                    normalized_job = {
-                        "job_id": job.get("id"),
-                        "title": job.get("title"),
-                        "department": job.get("departmentName"),
-                        "department_external": job.get("departmentExternalName"),
-                        "teams": job.get("teamNames", []),
-                        "location_primary": job.get("locationName"),
-                        "location_secondary": job.get("secondaryLocationNames", []),
-                        "location_address": job.get("locationAddress"),
-                        "employment_type": job.get("employmentType"),
-                        "workplace_type": job.get("workplaceType"),
-                        "is_listed": job.get("isListed"),
-                        "is_confidential": job.get("isConfidential"),
-                        "application_deadline": job.get("applicationDeadline"),
-                        "salary_range": job.get("scrapeableCompensationSalarySummary"),
-                        "salary_summary": job.get("compensationTierSummary"),
-                        "compensation_tiers": [
-                            tier.get("tierSummary")
-                            for tier in job.get("compensationTiers", [])
-                        ],
-                        "compensation_details_html": html_to_text(job.get("compensationPhilosophyHtml")),
-                        "description_html": html_to_text(job.get("descriptionHtml"))
-                    }
-
-                    job_text = json.dumps(normalized_job, ensure_ascii=False)
-                    upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
+                    try:
+                        detail_json = response.json()
+                    except ValueError as e:
+                        logging.error(f"Failed to parse job detail JSON for {job_id}: {e}")
+                    else:
+                        job_detail = build_job_detail_json(detail_json)
+                        upload_job_details_to_gcs(job_detail, job_id, BUCKET_NAME, FOLDER_NAME)
 
     # Mark old jobs as inactive
     for entry in master_list:

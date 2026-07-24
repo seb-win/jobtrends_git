@@ -1,7 +1,12 @@
+import html
+import json
 import logging
+import re
 import time
+
 import psutil
 from bs4 import BeautifulSoup
+from orchestrator.schemas.job_detail_v1 import build_full_text, clean_text, make_job_detail, make_section
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -73,6 +78,155 @@ extraction_logic = {
 PARAMS = None
 JSON_PAYLOAD = None
 DATA = None
+
+
+def _canonical_section_name(heading):
+    heading_text = clean_text(heading)
+    if not heading_text:
+        return "other"
+
+    normalized = heading_text.casefold().rstrip(":")
+    if "summary" in normalized:
+        return "description"
+    if "what you'll do" in normalized or "what you will do" in normalized:
+        return "responsibilities"
+    if "what you’ll do" in normalized:
+        return "responsibilities"
+    if "what you'll bring" in normalized or "what you will bring" in normalized:
+        return "qualifications"
+    if "what you’ll bring" in normalized:
+        return "qualifications"
+    if "compensation" in normalized or "base pay" in normalized:
+        return "compensation"
+    if "equal opportunity" in normalized:
+        return "equal_opportunity"
+    return "other"
+
+
+def _html_to_sections(html_text):
+    if not html_text:
+        return []
+
+    soup = BeautifulSoup(html.unescape(str(html_text)), "html.parser")
+    sections = []
+    current = {"name": "about", "heading": None, "text_parts": [], "items": []}
+
+    def flush_current():
+        section = make_section(
+            current["name"],
+            heading=current["heading"],
+            text=build_full_text(*current["text_parts"]),
+            items=current["items"],
+        )
+        if section:
+            sections.append(section)
+
+    for element in soup.find_all(["p", "li"], recursive=True):
+        if element.name != "li" and element.find_parent("li"):
+            continue
+
+        text = clean_text(element.get_text(" ", strip=True))
+        if not text:
+            continue
+
+        strong_text = None
+        strong = element.find("strong")
+        if strong:
+            strong_text = clean_text(strong.get_text(" ", strip=True))
+
+        is_heading = bool(strong_text and clean_text(element.get_text(" ", strip=True)) == strong_text)
+        if text.startswith("Wiz is an equal opportunity employer"):
+            flush_current()
+            current = {
+                "name": "equal_opportunity",
+                "heading": None,
+                "text_parts": [text],
+                "items": [],
+            }
+            continue
+
+        if is_heading:
+            flush_current()
+            current = {
+                "name": _canonical_section_name(strong_text),
+                "heading": strong_text.rstrip(":"),
+                "text_parts": [],
+                "items": [],
+            }
+            continue
+
+        if element.name == "li":
+            current["items"].append(text)
+        else:
+            current["text_parts"].append(text)
+
+    flush_current()
+    return sections
+
+
+def _extract_application_close_date(detail_json):
+    for item in detail_json.get("metadata") or []:
+        if item.get("name") == "Application Close Date":
+            return item.get("value")
+    return None
+
+
+def _extract_compensation(detail_json):
+    html_text = detail_json.get("content") or detail_json.get("description")
+    if not html_text:
+        return {}
+
+    soup = BeautifulSoup(html.unescape(str(html_text)), "html.parser")
+    pay_container = soup.select_one(".content-pay-transparency")
+    if not pay_container:
+        return {}
+
+    pay_text = clean_text(pay_container.get_text(" ", strip=True))
+    range_text = clean_text(pay_container.select_one(".pay-range").get_text(" ", strip=True)) if pay_container.select_one(".pay-range") else None
+    min_value = max_value = None
+    currency = None
+    if range_text:
+        values = [int(value.replace(",", "")) for value in re.findall(r"\$\s*([0-9][0-9,]*)", range_text)]
+        if values:
+            min_value = values[0]
+            max_value = values[1] if len(values) > 1 else None
+            currency = "USD"
+
+    return {
+        "raw": range_text or pay_text,
+        "currency": currency,
+        "min": min_value,
+        "max": max_value,
+        "period": "year" if range_text and "base" in pay_text.casefold() else None,
+        "text": pay_text,
+        "locale": "US" if range_text and "US" in range_text else None,
+        "location_id": None,
+    }
+
+
+def build_job_detail_v1_from_json(detail_json):
+    html_text = detail_json.get("content") or detail_json.get("description")
+    sections = _html_to_sections(html_text)
+    full_text = build_full_text(html_text)
+
+    return make_job_detail(
+        job_id=detail_json.get("id"),
+        title=detail_json.get("title") or detail_json.get("jobTitle"),
+        company="Wiz",
+        metadata={
+            "department": detail_json.get("team"),
+            "job_family": detail_json.get("department"),
+            "locations": detail_json.get("location"),
+            "updated_at": _extract_application_close_date(detail_json),
+        },
+        full_text=full_text,
+        sections=sections,
+        compensation=_extract_compensation(detail_json),
+    )
+
+
+def build_job_detail_json(detail_json):
+    return json.dumps(build_job_detail_v1_from_json(detail_json), ensure_ascii=False, indent=2)
 
 
 def process_jobs(job_data, job_data_keys):
@@ -234,9 +388,16 @@ def update_master_list_with_jobs(jobs, master_list):
                     request_type=REQUEST_TYPE_SINGLE
                 )
                 if response:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    job_text = soup.get_text()
-                    upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
+                    try:
+                        detail_json = response.json()
+                    except ValueError:
+                        detail_json = dict(job)
+                        detail_json["content"] = response.text
+                    job_detail_json = build_job_detail_json(detail_json)
+                    upload_job_details_to_gcs(job_detail_json, job_id, BUCKET_NAME, FOLDER_NAME)
+            elif job.get('description'):
+                job_detail_json = build_job_detail_json(job)
+                upload_job_details_to_gcs(job_detail_json, job_id, BUCKET_NAME, FOLDER_NAME)
 
         processed_jobs_count += 1
 

@@ -1,5 +1,6 @@
 import logging
 import re
+import json
 from bs4 import BeautifulSoup
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list, 
@@ -52,6 +53,184 @@ params = {
 }
 
 DAILY_JOB_URL = 'https://jobs.sap.com/search/'
+
+
+SECTION_NAME_MAP = {
+    "we help the world run better": "about",
+    "what you'll do": "responsibilities",
+    "what you bring": "qualifications",
+    "meet your team": "about",
+    "bring out your best": "about",
+    "we win with inclusion": "equal_opportunity",
+}
+
+
+def clean_text(value):
+    if value is None:
+        return None
+    if hasattr(value, "get_text"):
+        value = value.get_text(" ", strip=True)
+    text = re.sub(r"\s+", " ", str(value)).strip()
+    return text or None
+
+
+def extract_property(soup, property_id):
+    element = soup.select_one(f'[data-careersite-propertyid="{property_id}"]')
+    return clean_text(element)
+
+
+def extract_location(soup):
+    location = clean_text(soup.select_one(".jobGeoLocation"))
+    if location:
+        return location
+    return extract_property(soup, "location")
+
+
+def section_name_for_heading(heading):
+    normalized = heading.lower().rstrip(":") if heading else ""
+    return SECTION_NAME_MAP.get(normalized, "other")
+
+
+def extract_description_sections(description):
+    sections = []
+    current = None
+
+    for child in description.find_all(["p", "ul", "ol"], recursive=False):
+        strong = child.find("strong")
+        heading = clean_text(strong)
+        child_text = clean_text(child)
+
+        if heading and child_text and child_text.startswith(heading):
+            body = clean_text(child_text[len(heading):])
+            if heading.rstrip(":").lower() in SECTION_NAME_MAP:
+                if current:
+                    sections.append(current)
+                current = {
+                    "name": section_name_for_heading(heading),
+                    "heading": heading.rstrip(":"),
+                    "text": body,
+                    "items": [],
+                }
+                continue
+
+        items = [clean_text(item) for item in child.find_all("li", recursive=False)]
+        items = [item for item in items if item]
+        if items and current:
+            current["items"].extend(items)
+            continue
+
+        if child_text and current:
+            current["text"] = clean_text(" ".join(
+                text for text in [current.get("text"), child_text] if text
+            ))
+        elif child_text:
+            sections.append({
+                "name": "description",
+                "heading": None,
+                "text": child_text,
+                "items": [],
+            })
+
+    if current:
+        sections.append(current)
+
+    return [
+        section for section in sections
+        if section["text"] or section["items"]
+    ]
+
+
+def extract_compensation(full_text):
+    if not full_text:
+        return {
+            "raw": None,
+            "currency": None,
+            "min": None,
+            "max": None,
+            "period": None,
+            "text": None,
+            "locale": None,
+            "location_id": None,
+        }
+
+    marker = "Compensation Range Transparency"
+    if marker not in full_text:
+        return {
+            "raw": None,
+            "currency": None,
+            "min": None,
+            "max": None,
+            "period": None,
+            "text": None,
+            "locale": None,
+            "location_id": None,
+        }
+
+    text = full_text[full_text.index(marker):]
+    end_markers = [" AI Usage in the Recruitment Process", " Please note"]
+    for end_marker in end_markers:
+        if end_marker in text:
+            text = text[:text.index(end_marker)]
+            break
+
+    range_match = re.search(
+        r"(\d[\d,]*)\s*-\s*(\d[\d,]*)\s*\(?([A-Z]{3})\)?",
+        text,
+    )
+
+    return {
+        "raw": clean_text(text),
+        "currency": range_match.group(3) if range_match else None,
+        "min": int(range_match.group(1).replace(",", "")) if range_match else None,
+        "max": int(range_match.group(2).replace(",", "")) if range_match else None,
+        "period": "year",
+        "text": clean_text(text),
+        "locale": "en_US",
+        "location_id": None,
+    }
+
+
+def build_job_detail_v1_from_html(html):
+    soup = BeautifulSoup(html, "html.parser")
+    description = soup.select_one(".jobdescription")
+    full_text = clean_text(description)
+    location = extract_location(soup)
+    posted_at = extract_property(soup, "date")
+
+    posted_meta = soup.select_one('meta[itemprop="datePosted"]')
+    if posted_meta and posted_meta.get("content"):
+        posted_at = clean_text(posted_meta.get("content"))
+
+    compensation = extract_compensation(full_text)
+
+    return {
+        "schema_version": "job_detail_v1",
+        "job": {
+            "id": extract_property(soup, "facility"),
+            "title": extract_property(soup, "title"),
+            "company": "SAP",
+        },
+        "metadata": {
+            "department": extract_property(soup, "department"),
+            "job_family": None,
+            "role_type": None,
+            "employment_type": extract_property(soup, "shifttype"),
+            "job_type": None,
+            "career_level": extract_property(soup, "customfield3"),
+            "experience_level": None,
+            "required_travel": extract_property(soup, "travel"),
+            "locations": [location] if location else [],
+            "created_at": None,
+            "posted_at": posted_at,
+            "updated_at": None,
+        },
+        "content": {
+            "full_text": full_text,
+            "full_text_truncated": False,
+            "sections": extract_description_sections(description) if description else [],
+        },
+        "compensation": compensation,
+    }
 
 
 def process_jobs(job_postings):
@@ -212,9 +391,8 @@ def update_master_list_with_jobs(all_jobs, master_list):
                     request_type=REQUEST_TYPE_SINGLE
                 )
                 if response:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    job_text = soup.find_all('div', class_='joblayouttoken')
-                    text_content = "\n".join([div.text.strip() for div in job_text])
+                    job_detail = build_job_detail_v1_from_html(response.text)
+                    text_content = json.dumps(job_detail, ensure_ascii=False)
                     upload_job_details_to_gcs(text_content, job_id, BUCKET_NAME, FOLDER_NAME)
 
     # Mark old jobs as inactive

@@ -1,7 +1,10 @@
+import json
 import logging
 import time
+
 import psutil
 from bs4 import BeautifulSoup
+from orchestrator.schemas.job_detail_v1 import build_full_text, clean_text, make_job_detail, make_section
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -73,6 +76,155 @@ extraction_logic = {
 PARAMS = None
 JSON_PAYLOAD = None
 DATA = None
+
+
+def _section_name_for_heading(heading, default="other"):
+    heading_text = clean_text(heading)
+    if not heading_text:
+        return default
+
+    normalized = heading_text.casefold()
+    if any(token in normalized for token in ("what you'll do", "what you will do", "key responsibilities", "responsibilities")):
+        return "responsibilities"
+    if any(token in normalized for token in ("candidate profile", "what you bring", "what would set you apart", "great, but not required")):
+        return "qualifications"
+    if "benefit" in normalized or "perk" in normalized:
+        return "benefits"
+    if "compensation" in normalized or "base pay" in normalized or "pay zone" in normalized:
+        return "compensation"
+    if "about atlassian" in normalized:
+        return "about"
+    if "about" in normalized:
+        return "about"
+    if "equal opportunity" in normalized or "eeo" in normalized:
+        return "equal_opportunity"
+    return default
+
+
+def _html_to_structured_sections(html_text, default_name, default_heading):
+    if not html_text:
+        return []
+
+    soup = BeautifulSoup(html_text, "html.parser")
+    sections = []
+    current = {
+        "name": default_name,
+        "heading": default_heading,
+        "text_parts": [],
+        "items": [],
+    }
+
+    def flush_current():
+        section = make_section(
+            current["name"],
+            heading=current["heading"],
+            text=build_full_text(*current["text_parts"]),
+            items=current["items"],
+        )
+        if section:
+            sections.append(section)
+
+    for element in soup.find_all(["h1", "h2", "h3", "strong", "p", "li", "blockquote"], recursive=True):
+        if element.find_parent("li") and element.name != "li":
+            continue
+
+        text = clean_text(element.get_text(" ", strip=True))
+        if not text:
+            continue
+
+        if element.name == "strong":
+            continue
+
+        strong_child = element.find("strong", recursive=False) if element.name == "p" else None
+        is_heading = element.name in {"h1", "h2", "h3"} or (
+            strong_child is not None and clean_text(strong_child.get_text(" ", strip=True)) == text
+        )
+        if is_heading:
+            flush_current()
+            current = {
+                "name": _section_name_for_heading(text, default_name),
+                "heading": text,
+                "text_parts": [],
+                "items": [],
+            }
+            continue
+
+        if element.name == "li":
+            current["items"].append(text)
+        else:
+            current["text_parts"].append(text)
+
+    flush_current()
+    return sections
+
+
+def _extract_compensation_text(detail_json, full_text):
+    explicit_text = build_full_text(detail_json.get("payRanges"), detail_json.get("compensation"))
+    if explicit_text:
+        return explicit_text
+
+    if not full_text:
+        return None
+
+    markers = ["Compensation", "In the United States"]
+    end_markers = ["Benefits & Perks", "Benefits and Perks", "About Atlassian"]
+    for marker in markers:
+        marker_index = full_text.find(marker)
+        if marker_index == -1:
+            continue
+        end_index = len(full_text)
+        for end_marker in end_markers:
+            candidate = full_text.find(end_marker, marker_index + len(marker))
+            if candidate != -1:
+                end_index = min(end_index, candidate)
+        return clean_text(full_text[marker_index:end_index], separator="\n")
+
+    return None
+
+
+def build_job_detail_v1_from_json(detail_json):
+    """Build a job_detail_v1 payload from an Atlassian listing/detail JSON object."""
+    sections = []
+    sections.extend(_html_to_structured_sections(detail_json.get("overview"), "description", "Overview"))
+    sections.extend(_html_to_structured_sections(detail_json.get("responsibilities"), "responsibilities", "Responsibilities"))
+    sections.extend(_html_to_structured_sections(detail_json.get("qualifications"), "qualifications", "Qualifications"))
+
+    compensation_source = build_full_text(detail_json.get("payRanges"), detail_json.get("compensation"))
+    if compensation_source:
+        compensation_section = make_section(
+            "compensation",
+            heading="Compensation",
+            text=compensation_source,
+        )
+        if compensation_section:
+            sections.append(compensation_section)
+
+    full_text = build_full_text(
+        detail_json.get("overview"),
+        detail_json.get("responsibilities"),
+        detail_json.get("qualifications"),
+        detail_json.get("payRanges"),
+        detail_json.get("compensation"),
+    )
+    compensation_text = _extract_compensation_text(detail_json, full_text)
+
+    return make_job_detail(
+        job_id=detail_json.get("id"),
+        title=detail_json.get("title"),
+        company="Atlassian",
+        metadata={
+            "department": detail_json.get("category"),
+            "locations": detail_json.get("locations"),
+            "updated_at": (detail_json.get("portalJobPost") or {}).get("updatedDate"),
+        },
+        full_text=full_text,
+        sections=sections,
+        compensation={
+            "raw": compensation_text,
+            "currency": "USD" if compensation_text and "$" in compensation_text else None,
+            "text": compensation_text,
+        },
+    )
 
 
 def process_jobs(job_data, job_data_keys):
@@ -212,24 +364,9 @@ def update_master_list_with_jobs(jobs, master_list):
             master_list.append(job)
             new_jobs_count += 1
 
-            # Fetch job details if a link is provided
-            # job_link = job.get('link')
-            # if job_link:
-            #     response = fetch_url(
-            #         job_link,
-            #         headers=HEADERS,
-            #         params=PARAMS,
-            #         json=JSON_PAYLOAD,
-            #         data=DATA,
-            #         use_proxy=USE_PROXY_DETAILED_POSTINGS,
-            #         max_retries=3,
-            #         timeout=10,
-            #         request_type=REQUEST_TYPE_SINGLE
-            #     )
-            #     if response:
-            #         soup = BeautifulSoup(response.text, 'html.parser')
-            #         job_text = soup.get_text()
-            #         upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
+            job_detail = build_job_detail_v1_from_json(job)
+            job_detail_json = json.dumps(job_detail, ensure_ascii=False)
+            upload_job_details_to_gcs(job_detail_json, job_id, BUCKET_NAME, FOLDER_NAME)
 
     # Mark old jobs as inactive
     for entry in master_list:

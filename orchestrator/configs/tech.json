@@ -41,6 +41,9 @@
     "name": "cloudflare_scraper",
     "path": "scrapers/tech/cloudflare.py"
 }, {
+    "name": "databricks_scraper",
+    "path": "scrapers/tech/databricks.py"
+}, {
     "name": "wiz_scraper",
     "path": "scrapers/tech/wiz.py"
 }]

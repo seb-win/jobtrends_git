@@ -1,8 +1,16 @@
 import logging
 import time
 import psutil
+import json
 import re
 from bs4 import BeautifulSoup
+from orchestrator.schemas.job_detail_v1 import (
+    build_full_text,
+    clean_text,
+    make_job_detail,
+    make_section,
+    map_section_name,
+)
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -105,6 +113,191 @@ JSON_PAYLOAD = {
 }
 DATA = None
 
+
+
+def map_hpe_section_name(heading):
+    normalized = (clean_text(heading) or "").casefold()
+    if "who we are" in normalized:
+        return "about"
+    if "what we can offer" in normalized or "health" in normalized or "development" in normalized or "inclusion" in normalized:
+        return "benefits"
+    if "education and experience" in normalized:
+        return "requirements"
+    if "preferred skill" in normalized:
+        return "preferred_qualifications"
+    if "key responsibilit" in normalized:
+        return "responsibilities"
+    if "key competenc" in normalized:
+        return "qualifications"
+    if "stay connected" in normalized or "recruitment fraud" in normalized:
+        return "additional_information"
+    if "job description" in normalized:
+        return "description"
+    return map_section_name(heading)
+
+
+def _extract_heading_text(element):
+    if element.name in ("h1", "h2", "h3", "h4"):
+        return clean_text(element.get_text(" ", strip=True))
+
+    bold = element.find("b", recursive=False)
+    if bold:
+        return clean_text(bold.get_text(" ", strip=True))
+
+    return None
+
+
+def extract_hpe_sections(job_description_html):
+    if not job_description_html:
+        return []
+
+    soup = BeautifulSoup(job_description_html, "html.parser")
+    sections = []
+    intro_parts = []
+    current = None
+
+    def finish_current():
+        nonlocal current
+        if not current:
+            return
+
+        section = make_section(
+            current["name"],
+            heading=current["heading"],
+            text=build_full_text(*current["text_parts"]),
+            items=current["items"],
+        )
+        if section:
+            sections.append(section)
+        current = None
+
+    for element in soup.contents:
+        if isinstance(element, str):
+            text = clean_text(element)
+            if text:
+                if current:
+                    current["text_parts"].append(text)
+                else:
+                    intro_parts.append(text)
+            continue
+
+        if element.name not in ("p", "h1", "h2", "h3", "h4", "div", "ul"):
+            continue
+
+        if element.name == "ul":
+            items = [clean_text(li.get_text(" ", strip=True)) for li in element.find_all("li", recursive=False)]
+            items = [item for item in items if item]
+            if current:
+                current["items"].extend(items)
+            elif items:
+                current = {"name": "other", "heading": None, "text_parts": [], "items": items}
+            continue
+
+        heading = _extract_heading_text(element)
+        text = clean_text(element.get_text(" ", strip=True))
+        if not text:
+            continue
+
+        if heading and text == heading:
+            finish_current()
+            current = {"name": map_hpe_section_name(heading), "heading": heading, "text_parts": [], "items": []}
+            continue
+
+        if heading and text.startswith(heading):
+            finish_current()
+            remaining_text = clean_text(text[len(heading):])
+            current = {
+                "name": map_hpe_section_name(heading),
+                "heading": heading,
+                "text_parts": [remaining_text] if remaining_text else [],
+                "items": [],
+            }
+            continue
+
+        if current:
+            current["text_parts"].append(text)
+        else:
+            intro_parts.append(text)
+
+    finish_current()
+
+    intro_text = build_full_text(*intro_parts)
+    if intro_text:
+        sections.insert(0, make_section("description", heading=None, text=intro_text))
+
+    return [section for section in sections if section]
+
+
+def _extract_compensation(full_text):
+    if not full_text:
+        return None
+
+    match = re.search(
+        r"Annual Salary\s+([A-Z]{3})\s+([\d,]+)\s*-\s*([\d,]+)",
+        full_text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    raw_sentence = re.search(
+        r"[^.]*Annual Salary\s+[A-Z]{3}\s+[\d,]+\s*-\s*[\d,]+[^.]*\.",
+        full_text,
+        flags=re.IGNORECASE,
+    )
+    raw = clean_text(raw_sentence.group(0) if raw_sentence else match.group(0))
+    return {
+        "raw": raw,
+        "currency": match.group(1).upper(),
+        "min": int(match.group(2).replace(",", "")),
+        "max": int(match.group(3).replace(",", "")),
+        "period": "annual",
+        "text": raw,
+        "locale": None,
+        "location_id": None,
+    }
+
+
+def _extract_labeled_value(full_text, label):
+    if not full_text:
+        return None
+    match = re.search(
+        rf"\b{re.escape(label)}:\s*(.+?)(?=\s+Job Level:|\s+HPE is an Equal|\s+\"The expected|$)",
+        full_text,
+    )
+    return clean_text(match.group(1)) if match else None
+
+
+def build_job_detail_v1_from_json(detail_json):
+    job = detail_json.get("jobPostingInfo", {}) if isinstance(detail_json, dict) else {}
+    org = detail_json.get("hiringOrganization", {}) if isinstance(detail_json, dict) else {}
+    job_description_html = job.get("jobDescription")
+    full_text = clean_text(job_description_html, separator="\n")
+    location = job.get("location") or (job.get("jobRequisitionLocation") or {}).get("descriptor")
+
+    return make_job_detail(
+        job_id=job.get("jobReqId") or job.get("id"),
+        title=job.get("title"),
+        company=org.get("name") or "Hewlett Packard Enterprise",
+        metadata={
+            "department": _extract_labeled_value(full_text, "Job"),
+            "employment_type": job.get("timeType"),
+            "job_type": _extract_role_type_from_text(full_text),
+            "career_level": _extract_labeled_value(full_text, "Job Level"),
+            "locations": [location] if location else [],
+            "posted_at": job.get("startDate"),
+        },
+        full_text=full_text,
+        sections=extract_hpe_sections(job_description_html),
+        compensation=_extract_compensation(full_text),
+    )
+
+
+def _extract_role_type_from_text(full_text):
+    if not full_text:
+        return None
+    match = re.search(r"designed as ['‘’\"]{1,2}([^'‘’\"]+)['‘’\"]{1,2}", full_text, flags=re.IGNORECASE)
+    return clean_text(match.group(1)) if match else None
 
 def process_jobs(job_data, job_data_keys):
     """
@@ -283,9 +476,10 @@ def update_master_list_with_jobs(jobs, master_list):
                     request_type=REQUEST_TYPE_SINGLE
                 )
                 if response:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    job_text = soup.get_text()
-                    upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
+                    detail_data = response.json()
+                    job_detail = build_job_detail_v1_from_json(detail_data)
+                    job_detail_json = json.dumps(job_detail, ensure_ascii=False)
+                    upload_job_details_to_gcs(job_detail_json, job_id, BUCKET_NAME, FOLDER_NAME)
 
     # Mark old jobs as inactive
     for entry in master_list:

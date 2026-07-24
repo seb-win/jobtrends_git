@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 import re
 import json
 import requests
+from html import unescape
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -108,6 +109,212 @@ JSON_PAYLOAD = {
     'locationData': {},
 }
 DATA = None
+
+
+def clean_text(value):
+    if value is None:
+        return None
+
+    text = BeautifulSoup(str(value), "html.parser").get_text(" ", strip=True)
+    text = unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or None
+
+
+def section_name_from_heading(heading):
+    normalized = re.sub(r"[^a-z0-9]+", " ", (heading or "").lower()).strip()
+
+    if normalized in {"in this role you will get to", "what you will do", "what youll do", "your role"}:
+        return "responsibilities"
+    if normalized in {"required skills", "requirements", "required qualifications"}:
+        return "requirements"
+    if normalized in {"minimum qualifications", "minimum requirements"}:
+        return "minimum_qualifications"
+    if normalized in {"preferred qualifications", "preferred requirements", "nice to have"}:
+        return "preferred_qualifications"
+    if normalized in {"benefits", "perks", "pay benefits"}:
+        return "benefits"
+    if normalized in {"salary", "compensation", "pay transparency"}:
+        return "compensation"
+    if normalized in {"additional information"}:
+        return "additional_information"
+    if normalized in {"about the job", "job description", "description"}:
+        return "description"
+    if normalized in {"about us", "about the team"}:
+        return "about"
+
+    return "other"
+
+
+def extract_sections_from_description_html(description_html):
+    if not description_html:
+        return []
+
+    soup = BeautifulSoup(description_html, "html.parser")
+    sections = []
+    current = None
+
+    def finish_current():
+        if not current:
+            return
+
+        text = clean_text(" ".join(current["text_parts"]))
+        items = [item for item in current["items"] if item]
+        if text or items:
+            sections.append({
+                "name": current["name"],
+                "heading": current["heading"],
+                "text": text,
+                "items": items
+            })
+
+    for element in soup.find_all(["h1", "h2", "h3", "p", "ul", "ol"], recursive=True):
+        if element.find_parent(["li"]):
+            continue
+
+        if element.name in {"h1", "h2", "h3"}:
+            finish_current()
+            heading = clean_text(element.get_text(" ", strip=True))
+            current = {
+                "name": section_name_from_heading(heading),
+                "heading": heading,
+                "text_parts": [],
+                "items": []
+            }
+            continue
+
+        if current is None:
+            current = {
+                "name": "description",
+                "heading": None,
+                "text_parts": [],
+                "items": []
+            }
+
+        if element.name == "p":
+            strong = element.find("strong", recursive=False)
+            heading = clean_text(strong.get_text(" ", strip=True)) if strong else None
+            paragraph_text = clean_text(element.get_text(" ", strip=True))
+            if heading and paragraph_text and heading.rstrip(":") == paragraph_text.rstrip(":"):
+                finish_current()
+                current = {
+                    "name": section_name_from_heading(heading),
+                    "heading": heading,
+                    "text_parts": [],
+                    "items": []
+                }
+                continue
+
+            text = clean_text(element.get_text(" ", strip=True))
+            if text:
+                current["text_parts"].append(text)
+        elif element.name in {"ul", "ol"}:
+            for li in element.find_all("li", recursive=False):
+                item = clean_text(li.get_text(" ", strip=True))
+                if item:
+                    current["items"].append(item)
+
+    finish_current()
+    return sections
+
+
+def parse_compensation(job_posting):
+    raw = (
+        job_posting.get("scrapeableCompensationSalarySummary")
+        or job_posting.get("compensationTierSummary")
+    )
+    raw = clean_text(raw)
+
+    compensation = {
+        "raw": raw,
+        "currency": None,
+        "min": None,
+        "max": None,
+        "period": None,
+        "text": raw,
+        "locale": None,
+        "location_id": None
+    }
+
+    if not raw:
+        return compensation
+
+    currency_match = re.search(r"[$€£]", raw)
+    if currency_match:
+        compensation["currency"] = {
+            "$": "USD",
+            "€": "EUR",
+            "£": "GBP"
+        }.get(currency_match.group(0))
+
+    numbers = re.findall(r"(\d+(?:\.\d+)?)\s*([KkMm])?", raw)
+    parsed_numbers = []
+    for number, suffix in numbers:
+        value = float(number)
+        if suffix.lower() == "k":
+            value *= 1000
+        elif suffix.lower() == "m":
+            value *= 1000000
+        parsed_numbers.append(int(value) if value.is_integer() else value)
+
+    if parsed_numbers:
+        compensation["min"] = parsed_numbers[0]
+    if len(parsed_numbers) > 1:
+        compensation["max"] = parsed_numbers[1]
+
+    return compensation
+
+
+def build_job_detail_v1_from_json(job_json):
+    job_posting = job_json.get("data", {}).get("jobPosting", job_json)
+    if not isinstance(job_posting, dict):
+        job_posting = {}
+
+    description_html = job_posting.get("descriptionHtml")
+    full_text = clean_text(description_html)
+    team_names = job_posting.get("teamNames") or []
+    secondary_locations = job_posting.get("secondaryLocationNames") or []
+    locations = []
+
+    primary_location = clean_text(job_posting.get("locationName"))
+    if primary_location:
+        locations.append(primary_location)
+    for location in secondary_locations:
+        cleaned_location = clean_text(location)
+        if cleaned_location and cleaned_location not in locations:
+            locations.append(cleaned_location)
+
+    department_name = clean_text(job_posting.get("departmentExternalName") or job_posting.get("departmentName"))
+    team_name = clean_text(team_names[0]) if team_names else None
+
+    return {
+        "schema_version": "job_detail_v1",
+        "job": {
+            "id": clean_text(job_posting.get("id")),
+            "title": clean_text(job_posting.get("title")),
+            "company": "Snowflake"
+        },
+        "metadata": {
+            "department": team_name or department_name,
+            "job_family": department_name if team_name else None,
+            "role_type": None,
+            "employment_type": clean_text(job_posting.get("employmentType")),
+            "job_type": clean_text(job_posting.get("workplaceType")),
+            "career_level": None,
+            "experience_level": None,
+            "required_travel": None,
+            "locations": locations,
+            "created_at": None,
+            "posted_at": None,
+            "updated_at": None
+        },
+        "content": {
+            "full_text": full_text,
+            "full_text_truncated": False,
+            "sections": extract_sections_from_description_html(description_html)
+        },
+        "compensation": parse_compensation(job_posting)
+    }
 
 
 def process_jobs(job_data, job_data_keys):
@@ -332,15 +539,17 @@ def update_master_list_with_jobs(jobs, master_list):
                 )
                 if response:
                     job_json = json.loads(response.text)
-                    job_text = job_json.get('data', {}).get('jobPosting')
+                    job_detail = build_job_detail_v1_from_json(job_json)
 
-                    if isinstance(job_text, dict):
-                        job_text.pop("applicationForm", None)
-                        job_text.pop('surveyForms', None)
-                        upload_job_details_to_gcs(str(job_text), job_id, BUCKET_NAME, FOLDER_NAME)
+                    if isinstance(job_detail, dict):
+                        upload_job_details_to_gcs(
+                            json.dumps(job_detail, ensure_ascii=False),
+                            job_id,
+                            BUCKET_NAME,
+                            FOLDER_NAME
+                        )
                     else:
-                        print(f"Warning: job_text is None or not a dict for job_id {job_id}")
-                    upload_job_details_to_gcs(str(job_text), job_id, BUCKET_NAME, FOLDER_NAME)
+                        print(f"Warning: job_detail is None or not a dict for job_id {job_id}")
 
         processed_jobs_count += 1
 
@@ -392,4 +601,3 @@ if __name__ == "__main__":
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
     main()
-

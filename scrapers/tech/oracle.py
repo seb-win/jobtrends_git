@@ -1,4 +1,6 @@
+import json
 import logging
+import re
 import time
 import psutil
 from bs4 import BeautifulSoup
@@ -74,6 +76,192 @@ extraction_logic = {
 PARAMS = {}
 JSON_PAYLOAD = None
 DATA = None
+
+
+def clean_html_text(value):
+    """Return source text with HTML tags/entities removed and whitespace normalized."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        value = str(value)
+    soup = BeautifulSoup(value, 'html.parser')
+    text = soup.get_text("\n")
+    text = re.sub(r'\xa0|&nbsp;', ' ', text)
+    text = re.sub(r'[ \t\r\f\v]+', ' ', text)
+    text = re.sub(r'\n\s*\n+', '\n', text)
+    text = re.sub(r'\s*\n\s*', '\n', text)
+    text = text.strip()
+    return text or None
+
+
+def clean_plain_text(value):
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        value = str(value)
+    text = re.sub(r'\xa0|&nbsp;', ' ', value)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text or None
+
+
+def get_flex_field(job, prompt):
+    for field in job.get('requisitionFlexFields') or []:
+        if field.get('Prompt') == prompt:
+            return clean_plain_text(field.get('Value'))
+    return None
+
+
+def get_locations(job):
+    locations = []
+    primary = clean_plain_text(job.get('PrimaryLocation'))
+    if primary:
+        locations.append(primary)
+    for location in job.get('secondaryLocations') or []:
+        name = clean_plain_text(location.get('Name'))
+        if name and name not in locations:
+            locations.append(name)
+    return locations
+
+
+def html_list_items(value):
+    if not value:
+        return []
+    soup = BeautifulSoup(value, 'html.parser')
+    items = []
+    for item in soup.find_all('li'):
+        text = clean_plain_text(item.get_text(' '))
+        if text:
+            items.append(text)
+    return items
+
+
+def add_section(sections, name, heading, text=None, items=None):
+    cleaned_text = clean_html_text(text) if text else None
+    cleaned_items = [item for item in (items or []) if item]
+    if cleaned_text or cleaned_items:
+        sections.append({
+            'name': name,
+            'heading': heading,
+            'text': cleaned_text,
+            'items': cleaned_items,
+        })
+
+
+def parse_compensation(job):
+    qualifications_text = clean_html_text(job.get('ExternalQualificationsStr'))
+    if not qualifications_text:
+        return {
+            'raw': None,
+            'currency': None,
+            'min': None,
+            'max': None,
+            'period': None,
+            'text': None,
+            'locale': None,
+            'location_id': None,
+        }
+
+    match = re.search(
+        r'(US:\s*Hiring Range(?: in USD)?:?\s*from:?\s*\$([\d,]+)\s*to\s*\$([\d,]+)\s*per annum[^\n.]*(?:\.[^\n]*)?)',
+        qualifications_text,
+        re.IGNORECASE,
+    )
+    raw = match.group(1).strip() if match else None
+    min_value = int(match.group(2).replace(',', '')) if match else None
+    max_value = int(match.group(3).replace(',', '')) if match else None
+    return {
+        'raw': raw,
+        'currency': 'USD' if match else None,
+        'min': min_value,
+        'max': max_value,
+        'period': 'year' if match else None,
+        'text': raw,
+        'locale': 'US' if match else None,
+        'location_id': None,
+    }
+
+
+def extract_detail_item(detail_data):
+    if isinstance(detail_data, dict):
+        items = detail_data.get('items')
+        if isinstance(items, list) and items:
+            return items[0]
+    return detail_data if isinstance(detail_data, dict) else {}
+
+
+def build_job_detail_v1_from_json(detail_data):
+    job = extract_detail_item(detail_data)
+    description_text = clean_html_text(job.get('ExternalDescriptionStr'))
+    short_description = clean_plain_text(job.get('ShortDescriptionStr'))
+    responsibilities_text = clean_html_text(job.get('ExternalResponsibilitiesStr'))
+    qualifications_text = clean_html_text(job.get('ExternalQualificationsStr'))
+    corporate_text = clean_html_text(job.get('CorporateDescriptionStr'))
+
+    full_text_parts = [
+        short_description,
+        description_text,
+        responsibilities_text,
+        qualifications_text,
+        corporate_text,
+    ]
+    full_text = '\n\n'.join(part for part in full_text_parts if part) or None
+
+    sections = []
+    add_section(sections, 'description', 'Description', job.get('ExternalDescriptionStr'))
+    add_section(
+        sections,
+        'responsibilities',
+        'Responsibilities',
+        job.get('ExternalResponsibilitiesStr'),
+        html_list_items(job.get('ExternalResponsibilitiesStr')),
+    )
+    add_section(
+        sections,
+        'qualifications',
+        'Qualifications',
+        job.get('ExternalQualificationsStr'),
+        html_list_items(job.get('ExternalQualificationsStr')),
+    )
+    add_section(sections, 'about', 'About Oracle', job.get('CorporateDescriptionStr'))
+
+    return {
+        'schema_version': 'job_detail_v1',
+        'job': {
+            'id': clean_plain_text(job.get('Id')),
+            'title': clean_plain_text(job.get('Title')),
+            'company': 'Oracle',
+        },
+        'metadata': {
+            'department': clean_plain_text(job.get('JobFunction')) or clean_plain_text(job.get('JobFunctionCode')),
+            'job_family': clean_plain_text(job.get('Category')),
+            'role_type': get_flex_field(job, 'Role'),
+            'employment_type': get_flex_field(job, 'Job Type'),
+            'job_type': clean_plain_text(job.get('WorkplaceType')) or clean_plain_text(job.get('JobType')),
+            'career_level': clean_plain_text(job.get('JobLevel')) or extract_career_level(description_text, qualifications_text),
+            'experience_level': get_flex_field(job, 'Years'),
+            'required_travel': clean_plain_text(job.get('InternationalTravelRequired')) or clean_plain_text(job.get('DomesticTravelRequired')),
+            'locations': get_locations(job),
+            'created_at': None,
+            'posted_at': clean_plain_text(job.get('ExternalPostedStartDate')),
+            'updated_at': None,
+        },
+        'content': {
+            'full_text': full_text,
+            'full_text_truncated': False,
+            'sections': sections,
+        },
+        'compensation': parse_compensation(job),
+    }
+
+
+def extract_career_level(*texts):
+    for text in texts:
+        if not text:
+            continue
+        match = re.search(r'Career Level\s*-\s*([A-Z0-9]+)', text)
+        if match:
+            return match.group(1)
+    return None
 
 
 def process_jobs(job_data, job_data_keys):
@@ -239,9 +427,14 @@ def update_master_list_with_jobs(jobs, master_list):
                     request_type=REQUEST_TYPE_SINGLE
                 )
                 if response:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    job_text = soup.get_text()
-                    upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
+                    try:
+                        detail_data = response.json()
+                    except ValueError as e:
+                        logging.error(f"Failed to parse job detail JSON for {job_id}: {e}")
+                    else:
+                        job_detail = build_job_detail_v1_from_json(detail_data)
+                        job_detail_json = json.dumps(job_detail, ensure_ascii=False, indent=2)
+                        upload_job_details_to_gcs(job_detail_json, job_id, BUCKET_NAME, FOLDER_NAME)
 
     # Mark old jobs as inactive
     for entry in master_list:

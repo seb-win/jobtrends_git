@@ -1,7 +1,10 @@
+import json
 import logging
+import re
 import time
 import psutil
 from bs4 import BeautifulSoup
+from orchestrator.schemas.job_detail_v1 import build_full_text, clean_text, make_job_detail, make_section, map_section_name
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -71,6 +74,175 @@ extraction_logic = {
 PARAMS = None
 JSON_PAYLOAD = None
 DATA = None
+
+
+def _element_text(element, separator=" "):
+    if not element:
+        return None
+    return clean_text(element.get_text(separator=separator, strip=True), separator=separator)
+
+
+def _split_locations(location_text):
+    location_text = clean_text(location_text)
+    if not location_text:
+        return []
+    return [part.strip() for part in location_text.split(";") if part.strip()]
+
+
+def _section_from_block(block):
+    heading_el = block.find(["h2", "h3"])
+    heading = _element_text(heading_el)
+    if not heading:
+        return None
+
+    items = [_element_text(li) for li in block.find_all("li")]
+    items = [item for item in items if item]
+
+    text_parts = []
+    for child in block.children:
+        if getattr(child, "name", None) in ("h2", "h3"):
+            continue
+        if getattr(child, "name", None) == "ul":
+            continue
+        text = _element_text(child, separator="\n")
+        if text:
+            text_parts.append(text)
+
+    text = "\n".join(text_parts) if text_parts else None
+    if not text and items:
+        text = "\n".join(items)
+
+    return make_section(
+        _map_anthropic_section_name(heading),
+        heading=heading,
+        text=text,
+        items=items,
+    )
+
+
+def _map_anthropic_section_name(heading):
+    normalized = (clean_text(heading) or "").casefold().rstrip(":")
+    if normalized == "about anthropic":
+        return "about"
+    if normalized == "about the role":
+        return "description"
+    if normalized.startswith("you may be a good fit"):
+        return "qualifications"
+    if normalized == "logistics":
+        return "additional_information"
+    if normalized == "come work with us!":
+        return "benefits"
+    return map_section_name(heading)
+
+
+def _section_from_heading(heading_el):
+    heading = _element_text(heading_el)
+    if not heading:
+        return None
+
+    text_parts = []
+    items = []
+    for sibling in heading_el.next_siblings:
+        if getattr(sibling, "name", None) in ("h2", "h3"):
+            break
+        if not getattr(sibling, "name", None):
+            continue
+        if sibling.name == "ul":
+            for li in sibling.find_all("li", recursive=False):
+                item = _element_text(li)
+                if item:
+                    items.append(item)
+            continue
+        text = _element_text(sibling, separator="\n")
+        if text:
+            text_parts.append(text)
+
+    text = "\n".join(text_parts) if text_parts else None
+    if not text and items:
+        text = "\n".join(items)
+
+    return make_section(
+        _map_anthropic_section_name(heading),
+        heading=heading,
+        text=text,
+        items=items,
+    )
+
+
+def _extract_sections(description):
+    if not description:
+        return []
+
+    sections = []
+    seen_headings = set()
+    headings = description.find_all(["h2", "h3"])
+    source_nodes = headings or description.find_all("div", recursive=False)
+    for node in source_nodes:
+        section = _section_from_heading(node) if node.name in ("h2", "h3") else _section_from_block(node)
+        if section and section["heading"] not in seen_headings:
+            sections.append(section)
+            seen_headings.add(section["heading"])
+
+    return sections
+
+
+def _extract_compensation(soup):
+    pay_range = soup.select_one(".job__pay-ranges .pay-range")
+    if not pay_range:
+        return None
+
+    raw = _element_text(pay_range, separator=" ")
+    amounts = re.findall(r"\$([\d,]+)", raw or "")
+    if len(amounts) < 2:
+        return {"raw": raw, "text": raw}
+
+    return {
+        "raw": raw,
+        "currency": "USD" if "USD" in raw else None,
+        "min": int(amounts[0].replace(",", "")),
+        "max": int(amounts[1].replace(",", "")),
+        "period": "year" if re.search(r"\bannual\b", raw, re.I) else None,
+        "text": raw,
+        "locale": "US" if "USD" in raw else None,
+        "location_id": None,
+    }
+
+
+def build_job_detail_v1_from_html(html_text, job_id=None, fallback_job=None):
+    soup = BeautifulSoup(html_text or "", "html.parser")
+    fallback_job = fallback_job or {}
+
+    title = _element_text(soup.select_one(".job__title h1")) or fallback_job.get("jobTitle")
+    location_text = _element_text(soup.select_one(".job__location div"))
+    description = soup.select_one(".job__description")
+    sections = _extract_sections(description)
+    full_text = build_full_text(
+        _element_text(description, separator="\n"),
+        *(section.get("text") for section in sections),
+        *(section.get("items") for section in sections),
+    )
+
+    return make_job_detail(
+        job_id=job_id or fallback_job.get("id"),
+        title=title,
+        company="Anthropic",
+        metadata={
+            "department": fallback_job.get("team"),
+            "job_family": fallback_job.get("department"),
+            "locations": _split_locations(location_text) or fallback_job.get("location"),
+        },
+        full_text=full_text,
+        sections=sections,
+        compensation=_extract_compensation(soup),
+    )
+
+
+def build_job_detail_json_from_html(html_text, job_id=None, fallback_job=None):
+    return json.dumps(
+        build_job_detail_v1_from_html(html_text, job_id=job_id, fallback_job=fallback_job),
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 def process_jobs(job_data, job_data_keys):
@@ -236,9 +408,12 @@ def update_master_list_with_jobs(jobs, master_list):
                     request_type=REQUEST_TYPE_SINGLE
                 )
                 if response:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    job_text = soup.get_text()
-                    upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
+                    job_detail_json = build_job_detail_json_from_html(
+                        response.text,
+                        job_id=job_id,
+                        fallback_job=job,
+                    )
+                    upload_job_details_to_gcs(job_detail_json, job_id, BUCKET_NAME, FOLDER_NAME)
 
     # Mark old jobs as inactive
     for entry in master_list:

@@ -1,4 +1,7 @@
+import html
+import json
 import logging
+import re
 import time
 import psutil
 from bs4 import BeautifulSoup
@@ -76,6 +79,200 @@ PARAMS = {
 }
 JSON_PAYLOAD = None
 DATA = None
+
+
+HEADING_TO_SECTION = {
+    'about the role': 'about',
+    'about the role:': 'about',
+    "what you'll do": 'responsibilities',
+    "what you'll do:": 'responsibilities',
+    'what you’ll do': 'responsibilities',
+    'what you’ll do:': 'responsibilities',
+    'who you are': 'qualifications',
+    'who you are:': 'qualifications',
+    'minimum qualifications': 'minimum_qualifications',
+    'preferred': 'preferred_qualifications',
+    'preferred:': 'preferred_qualifications',
+    'preferred qualifications': 'preferred_qualifications',
+    'wondering if you’re a good fit?': 'other',
+    "wondering if you're a good fit?": 'other',
+    'why coreweave?': 'about',
+    'compensation and benefits': 'compensation',
+    'what we offer': 'benefits',
+    'california applicants': 'additional_information',
+    'equal opportunity & accommodations': 'equal_opportunity',
+    'export control compliance': 'additional_information',
+}
+
+COMPENSATION_RE = re.compile(
+    r'(?P<currency>\$|CAD\s*\$)\s*(?P<min>[0-9][0-9,]*)\s*(?:/CAD\s*)?to\s*(?P<max_currency>\$|CAD\s*\$)?\s*(?P<max>[0-9][0-9,]*)',
+    re.IGNORECASE,
+)
+
+
+def clean_text(value):
+    if value is None:
+        return None
+    text = BeautifulSoup(html.unescape(str(value)), 'html.parser').get_text(' ', strip=True)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text or None
+
+
+def clean_html_to_text(html_text):
+    if not html_text:
+        return None
+    soup = BeautifulSoup(html.unescape(str(html_text)), 'html.parser')
+    for tag in soup(['script', 'style']):
+        tag.decompose()
+    text = soup.get_text('\n', strip=True)
+    text = re.sub(r'[ \t\r\f\v]+', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = '\n'.join(line.strip() for line in text.splitlines())
+    return text.strip() or None
+
+
+def metadata_value(detail_json, name):
+    for item in detail_json.get('metadata') or []:
+        if item.get('name') == name:
+            return clean_text(item.get('value'))
+    return None
+
+
+def extract_locations(detail_json):
+    location_name = clean_text(get_nested_value(detail_json, ['location', 'name']))
+    if location_name:
+        return [part.strip() for part in location_name.split(' / ') if part.strip()]
+    return []
+
+
+def canonical_section_name(heading):
+    heading_key = (heading or '').strip().lower()
+    return HEADING_TO_SECTION.get(heading_key, 'other')
+
+
+def append_section(sections, heading, text_parts, items):
+    text = clean_text(' '.join(part for part in text_parts if part))
+    cleaned_items = [item for item in (clean_text(value) for value in items) if item]
+    if not heading and not text and not cleaned_items:
+        return
+    sections.append({
+        'name': canonical_section_name(heading),
+        'heading': clean_text(heading),
+        'text': text,
+        'items': cleaned_items,
+    })
+
+
+def extract_sections_from_html(html_text):
+    if not html_text:
+        return []
+    soup = BeautifulSoup(html.unescape(str(html_text)), 'html.parser')
+    for tag in soup(['script', 'style']):
+        tag.decompose()
+
+    sections = []
+    current_heading = None
+    current_text = []
+    current_items = []
+
+    for element in soup.find_all(['h1', 'h2', 'h3', 'h4', 'strong', 'p', 'li']):
+        if element.name == 'strong' and element.find_parent(['h1', 'h2', 'h3', 'h4']):
+            continue
+        text = clean_text(element.get_text(' ', strip=True))
+        if not text:
+            continue
+        is_heading = element.name in ['h1', 'h2', 'h3', 'h4'] or (
+            element.name == 'strong'
+            and element.parent
+            and element.parent.name == 'p'
+            and clean_text(element.parent.get_text(' ', strip=True)) == text
+        )
+        if is_heading:
+            append_section(sections, current_heading, current_text, current_items)
+            current_heading = text
+            current_text = []
+            current_items = []
+        elif element.name == 'li':
+            current_items.append(text)
+        elif element.name == 'p':
+            if element.find(['li']):
+                continue
+            current_text.append(text)
+
+    append_section(sections, current_heading, current_text, current_items)
+    return sections
+
+
+def extract_compensation(full_text):
+    compensation = {
+        'raw': None,
+        'currency': None,
+        'min': None,
+        'max': None,
+        'period': None,
+        'text': None,
+        'locale': None,
+        'location_id': None,
+    }
+    if not full_text:
+        return compensation
+    match = COMPENSATION_RE.search(full_text)
+    if not match:
+        return compensation
+    currency_token = (match.group('currency') or match.group('max_currency') or '').upper().replace(' ', '')
+    currency = 'CAD' if 'CAD' in currency_token else 'USD' if '$' in currency_token else None
+    sentence_start = full_text.rfind('.', 0, match.start()) + 1
+    sentence_end = full_text.find('.', match.end())
+    if sentence_end == -1:
+        sentence_end = len(full_text)
+    text = full_text[sentence_start:sentence_end + 1].strip()
+    compensation.update({
+        'raw': match.group(0),
+        'currency': currency,
+        'min': int(match.group('min').replace(',', '')),
+        'max': int(match.group('max').replace(',', '')),
+        'period': 'year',
+        'text': text or match.group(0),
+    })
+    return compensation
+
+
+def build_job_detail_v1_from_json(detail_json):
+    full_text = clean_html_to_text(detail_json.get('content'))
+    job_family = metadata_value(detail_json, 'Sub Department')
+    department = metadata_value(detail_json, 'Job Team / Cost Center')
+    return {
+        'schema_version': 'job_detail_v1',
+        'job': {
+            'id': clean_text(detail_json.get('requisition_id') or detail_json.get('id') or detail_json.get('internal_job_id')),
+            'title': clean_text(detail_json.get('title')),
+            'company': clean_text(detail_json.get('company_name')) or 'CoreWeave',
+        },
+        'metadata': {
+            'department': department,
+            'job_family': job_family,
+            'role_type': None,
+            'employment_type': None,
+            'job_type': None,
+            'career_level': None,
+            'experience_level': None,
+            'required_travel': None,
+            'locations': extract_locations(detail_json),
+            'created_at': clean_text(detail_json.get('first_published')),
+            'posted_at': clean_text(detail_json.get('first_published')),
+            'updated_at': clean_text(detail_json.get('updated_at')),
+        },
+        'content': {
+            'full_text': full_text,
+            'full_text_truncated': False,
+            'sections': extract_sections_from_html(detail_json.get('content')),
+        },
+        'compensation': extract_compensation(full_text),
+    }
+
+
+def job_detail_v1_json(detail_json):
+    return json.dumps(build_job_detail_v1_from_json(detail_json), ensure_ascii=False, indent=2)
 
 
 def process_jobs(job_data, job_data_keys):
@@ -209,6 +406,23 @@ def fetch_all_jobs():
     return all_jobs
 
 
+
+def listing_to_detail_json(job):
+    if job.get('description'):
+        return {
+            'id': job.get('id'),
+            'title': job.get('jobTitle'),
+            'company_name': 'CoreWeave',
+            'location': {'name': job.get('location')},
+            'metadata': [
+                {'name': 'Sub Department', 'value': job.get('department')},
+            ],
+            'first_published': job.get('created'),
+            'updated_at': job.get('last_updated'),
+            'content': job.get('description'),
+        }
+    return None
+
 def update_master_list_with_jobs(jobs, master_list):
     """
     Update the master list with new or existing jobs, fetch job details if needed,
@@ -237,24 +451,10 @@ def update_master_list_with_jobs(jobs, master_list):
             master_list.append(job)
             new_jobs_count += 1
 
-            # Fetch job details if a link is provided
-            # job_link = job.get('link')
-            # if job_link:
-            #     response = fetch_url(
-            #         job_link,
-            #         headers=HEADERS,
-            #         params=PARAMS,
-            #         json=JSON_PAYLOAD,
-            #         data=DATA,
-            #         use_proxy=USE_PROXY_DETAILED_POSTINGS,
-            #         max_retries=3,
-            #         timeout=10,
-            #         request_type=REQUEST_TYPE_SINGLE
-            #     )
-            #     if response:
-            #         soup = BeautifulSoup(response.text, 'html.parser')
-            #         job_text = soup.get_text()
-            #         upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
+            detail_json = listing_to_detail_json(job)
+            if detail_json:
+                job_detail = job_detail_v1_json(detail_json)
+                upload_job_details_to_gcs(job_detail, job_id, BUCKET_NAME, FOLDER_NAME)
 
 
     # Mark old jobs as inactive

@@ -2,7 +2,9 @@ import logging
 import time
 import psutil
 import json
-from bs4 import BeautifulSoup
+import re
+from html import unescape
+from html.parser import HTMLParser
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -79,6 +81,239 @@ JSON_PAYLOAD = {
     'searchText': '',
 }
 DATA = None
+
+
+class JobDescriptionParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.blocks = []
+        self.current = None
+        self.bold_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'p' and self.current and self.current['tag'] == 'li':
+            return
+        if tag in {'p', 'h1', 'h2', 'h3', 'li'}:
+            self.current = {'tag': tag, 'text': [], 'bold': self.bold_depth > 0}
+        if tag in {'b', 'strong'}:
+            self.bold_depth += 1
+            if self.current:
+                self.current['bold'] = True
+        if tag == 'br' and self.current:
+            self.current['text'].append('\n')
+
+    def handle_endtag(self, tag):
+        if tag in {'b', 'strong'} and self.bold_depth:
+            self.bold_depth -= 1
+        if tag == 'p' and self.current and self.current['tag'] == 'li':
+            return
+        if tag in {'p', 'h1', 'h2', 'h3', 'li'} and self.current:
+            text = clean_text(' '.join(self.current['text']))
+            if text:
+                self.blocks.append({
+                    'tag': self.current['tag'],
+                    'text': text,
+                    'bold': self.current['bold']
+                })
+            self.current = None
+
+    def handle_data(self, data):
+        if self.current:
+            self.current['text'].append(data)
+        else:
+            text = clean_text(data)
+            if text:
+                self.blocks.append({'tag': 'text', 'text': text, 'bold': False})
+
+
+def clean_text(value):
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        value = str(value)
+    text = unescape(re.sub(r'<[^>]+>', ' ', value))
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text or None
+
+
+def html_to_text(html):
+    if not html:
+        return None
+    parser = JobDescriptionParser()
+    parser.feed(html)
+    text = '\n'.join(block['text'] for block in parser.blocks)
+    return text or None
+
+
+def canonical_section_name(heading):
+    normalized = re.sub(r'\s+', ' ', (heading or '').strip()).lower()
+    if not normalized:
+        return 'other'
+    if normalized in {'position overview', 'job description', 'description'}:
+        return 'description'
+    if normalized in {'about autodesk', 'learn more'} or normalized.startswith('about '):
+        return 'about'
+    if normalized in {'responsibilities', 'what you will do', "what you'll do"}:
+        return 'responsibilities'
+    if normalized in {'minimum qualifications', 'minimum requirements'}:
+        return 'minimum_qualifications'
+    if normalized in {'preferred qualifications', 'preferred requirements'}:
+        return 'preferred_qualifications'
+    if normalized in {'things that describe you', 'who you are', 'about you'}:
+        return 'qualifications'
+    if normalized in {'benefits'}:
+        return 'benefits'
+    if normalized in {'salary transparency', 'compensation', 'pay transparency'}:
+        return 'compensation'
+    if normalized in {'equal employment opportunity', 'equal opportunity', 'eeo'}:
+        return 'equal_opportunity'
+    if normalized == 'belonging':
+        return 'equal_opportunity'
+    if normalized.startswith('are you an existing contractor'):
+        return 'additional_information'
+    return 'other'
+
+
+def extract_sections_from_html(html):
+    if not html:
+        return []
+
+    parser = JobDescriptionParser()
+    parser.feed(html)
+    sections = []
+    current = None
+
+    def add_current():
+        nonlocal current
+        if not current:
+            return
+        text_parts = [part for part in current.pop('_text_parts') if part]
+        current['text'] = clean_text(' '.join(text_parts))
+        if current['text'] or current['items']:
+            sections.append(current)
+        current = None
+
+    for block in parser.blocks:
+        text = block['text']
+        if not text:
+            continue
+        if text.lower() in {'job requisition id #', 'learn more'}:
+            continue
+
+        is_heading = (
+            block['tag'] in {'h1', 'h2', 'h3'}
+            or (block['tag'] == 'p' and block['bold'] and len(text) <= 80)
+        )
+
+        if is_heading:
+            add_current()
+            current = {
+                'name': canonical_section_name(text),
+                'heading': text,
+                'text': None,
+                'items': [],
+                '_text_parts': []
+            }
+            continue
+
+        if not current:
+            current = {
+                'name': 'description',
+                'heading': None,
+                'text': None,
+                'items': [],
+                '_text_parts': []
+            }
+
+        if block['tag'] == 'li':
+            current['items'].append(text)
+        else:
+            current['_text_parts'].append(text)
+
+    add_current()
+    return sections
+
+
+def extract_compensation(full_text):
+    if not full_text:
+        return {
+            'raw': None,
+            'currency': None,
+            'min': None,
+            'max': None,
+            'period': None,
+            'text': None,
+            'locale': None,
+            'location_id': None
+        }
+
+    salary_pattern = re.compile(
+        r'(Salary is one part.*?)(?=\n(?:Belonging|Equal Employment Opportunity|Are you an existing contractor)|$)',
+        re.IGNORECASE | re.DOTALL
+    )
+    match = salary_pattern.search(full_text)
+    text = clean_text(match.group(1)) if match else None
+    min_value = max_value = None
+    if text:
+        range_match = re.search(r'between\s+\$([\d,]+(?:\.\d+)?)\s+and\s+\$([\d,]+(?:\.\d+)?)', text)
+        if range_match:
+            min_value = float(range_match.group(1).replace(',', ''))
+            max_value = float(range_match.group(2).replace(',', ''))
+
+    return {
+        'raw': text,
+        'currency': 'USD' if text and '$' in text else None,
+        'min': min_value,
+        'max': max_value,
+        'period': 'year' if text and (min_value is not None or 'base salary' in text.lower()) else None,
+        'text': text,
+        'locale': 'US' if text and 'U.S.-based' in text else None,
+        'location_id': None
+    }
+
+
+def build_job_detail_v1_from_json(detail_json):
+    job_posting_info = detail_json.get('jobPostingInfo', detail_json)
+    description_html = job_posting_info.get('jobDescription')
+    full_text = html_to_text(description_html)
+
+    locations = []
+    primary_location = clean_text(job_posting_info.get('location'))
+    if primary_location:
+        locations.append(primary_location)
+    for location in job_posting_info.get('additionalLocations') or []:
+        cleaned_location = clean_text(location)
+        if cleaned_location and cleaned_location not in locations:
+            locations.append(cleaned_location)
+
+    return {
+        'schema_version': 'job_detail_v1',
+        'job': {
+            'id': clean_text(job_posting_info.get('jobReqId') or job_posting_info.get('id')),
+            'title': clean_text(job_posting_info.get('title')),
+            'company': clean_text((detail_json.get('hiringOrganization') or {}).get('name')) or 'Autodesk'
+        },
+        'metadata': {
+            'department': None,
+            'job_family': None,
+            'role_type': None,
+            'employment_type': clean_text(job_posting_info.get('timeType')),
+            'job_type': None,
+            'career_level': None,
+            'experience_level': None,
+            'required_travel': None,
+            'locations': locations,
+            'created_at': None,
+            'posted_at': clean_text(job_posting_info.get('startDate') or job_posting_info.get('postedOn')),
+            'updated_at': None
+        },
+        'content': {
+            'full_text': full_text,
+            'full_text_truncated': False,
+            'sections': extract_sections_from_html(description_html)
+        },
+        'compensation': extract_compensation(full_text)
+    }
 
 
 def process_jobs(job_data, job_data_keys):
@@ -257,8 +492,9 @@ def update_master_list_with_jobs(jobs, master_list):
                 )
                 if response:
                     json_text = json.loads(response.text)
-                    job_text = json_text['jobPostingInfo']
-                    upload_job_details_to_gcs(str(job_text), job_id, BUCKET_NAME, FOLDER_NAME)
+                    job_detail = build_job_detail_v1_from_json(json_text)
+                    job_text = json.dumps(job_detail, ensure_ascii=False)
+                    upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
 
     # Mark old jobs as inactive
     for entry in master_list:

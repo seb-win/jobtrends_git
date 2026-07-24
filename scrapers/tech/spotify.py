@@ -1,7 +1,10 @@
 import logging
+import json
+import re
 import time
 import psutil
 from bs4 import BeautifulSoup
+from orchestrator.schemas.job_detail_v1 import build_full_text, clean_text, make_job_detail, make_section
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -72,6 +75,228 @@ PARAMS = {
 }
 JSON_PAYLOAD = None
 DATA = None
+
+
+def _clean_lines(container):
+    if container is None:
+        return []
+
+    lines = []
+    for line in container.get_text("\n", strip=True).splitlines():
+        text = clean_text(line)
+        if text:
+            lines.append(text)
+    return lines
+
+
+def _extract_header_values(lines):
+    apply_markers = {"Link copied to clipboard.", "Apply now", "Apply"}
+    title = lines[0] if lines else None
+    department = None
+    metadata_lines = []
+    seen_apply = False
+
+    for line in lines[1:]:
+        if line in apply_markers:
+            seen_apply = True
+            continue
+        if seen_apply:
+            metadata_lines.append(line)
+            if len(metadata_lines) == 4:
+                break
+        elif department is None:
+            department = line
+
+    job_type = metadata_lines[2] if len(metadata_lines) > 3 else None
+    locations = metadata_lines[3] if len(metadata_lines) > 3 else metadata_lines[2] if len(metadata_lines) > 2 else None
+
+    return {
+        "title": title,
+        "department": department,
+        "job_family": metadata_lines[0] if len(metadata_lines) > 0 else None,
+        "role_type": None,
+        "job_type": job_type,
+        "locations": locations,
+    }
+
+
+def _section_name_for_heading(heading):
+    normalized = (heading or "").casefold()
+    if "what you'll do" in normalized or "what you will do" in normalized:
+        return "responsibilities"
+    if "who you are" in normalized:
+        return "qualifications"
+    if "where you'll be" in normalized or "where you will be" in normalized:
+        return "additional_information"
+    if "global benefits" in normalized:
+        return "benefits"
+    return "other"
+
+
+def _extract_structured_sections(main):
+    if main is None:
+        return []
+
+    sections = []
+    section_blocks = main.select("div.singlejob_descriptionText__7hiF9, div.closingtext_container__0pdbw, div.perks_container__E7jyf")
+    for block in section_blocks:
+        heading = block.find(["h2", "h3"]) or block.find(
+            ["p", "div"],
+            class_=lambda value: value and "headline-3" in value,
+        )
+        if heading is None:
+            continue
+        heading_text = clean_text(heading.get_text(" ", strip=True))
+        if not heading_text or heading_text in {"Quick clicks", "Learn about life at Spotify"}:
+            continue
+
+        texts = []
+        items = []
+        for element in block.find_all(["p", "div", "li"], recursive=True):
+            if element is heading or heading in element.parents:
+                continue
+            if element.find(["p", "div", "li"]):
+                continue
+            text = clean_text(element.get_text(" ", strip=True))
+            if not text or text == heading_text:
+                continue
+            if element.name == "li":
+                items.append(text)
+            elif "perks_text__" in " ".join(element.get("class", [])):
+                items.append(text)
+            else:
+                texts.append(text)
+
+        section = make_section(
+            _section_name_for_heading(heading_text),
+            heading=heading_text,
+            text=" ".join(texts) if texts else None,
+            items=items,
+        )
+        if section:
+            sections.append(section)
+
+    closing_text = main.select_one("div.closingtext_text__B9RMi")
+    if closing_text:
+        paragraphs = [clean_text(node.get_text(" ", strip=True)) for node in closing_text.find_all("div")]
+        paragraphs = [text for text in paragraphs if text]
+        if paragraphs:
+            compensation_text = next((text for text in paragraphs if "$" in text), None)
+            if compensation_text:
+                section = make_section("compensation", heading="Compensation", text=compensation_text)
+                if section:
+                    sections.append(section)
+
+            eeo_text = " ".join(
+                text for text in paragraphs
+                if "equal opportunity employer" in text.casefold()
+            )
+            if eeo_text:
+                section = make_section("equal_opportunity", heading="Equal opportunity", text=eeo_text)
+                if section:
+                    sections.append(section)
+
+    return sections
+
+
+def _extract_description_text(main):
+    if main is None:
+        return None
+
+    description = main.select_one("div.singlejob_descriptionTextNoPadding__j3OKM")
+    if description is None:
+        return None
+
+    texts = []
+    for element in description.find_all(["p", "div"], recursive=True):
+        if element.find(["p", "div"]):
+            continue
+        text = clean_text(element.get_text(" ", strip=True))
+        if text:
+            texts.append(text)
+
+    return "\n".join(texts) if texts else clean_text(description.get_text("\n", strip=True))
+
+
+def _extract_header_from_dom(main):
+    if main is None:
+        return {}
+
+    title_node = main.find("h1")
+    department_node = main.find("h3")
+    tag_nodes = main.select("div.tags_work-category__dLDLq p, div.tags_work-sub-category__eZ5y6 p")
+    details = [clean_text(node.get_text(" ", strip=True)) for node in main.select("div.detail-3")]
+    details = [text for text in details if text]
+
+    return {
+        "title": clean_text(title_node.get_text(" ", strip=True)) if title_node else None,
+        "department": clean_text(department_node.get_text(" ", strip=True)) if department_node else None,
+        "job_family": clean_text(tag_nodes[0].get_text(" ", strip=True)) if len(tag_nodes) > 0 else None,
+        "role_type": None,
+        "job_type": details[0] if len(details) > 1 else None,
+        "locations": details[-1] if details else None,
+    }
+
+
+def _extract_compensation(full_text):
+    if not full_text:
+        return None
+
+    match = re.search(
+        r"(?:base range|salary range|base salary range)[^.]*?(?:US)?\$([\d,]+)\s*-\s*(?:US)?\$([\d,]+)[^.]*\.",
+        full_text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    raw = clean_text(match.group(0))
+    return {
+        "raw": raw,
+        "currency": "USD",
+        "min": int(match.group(1).replace(",", "")),
+        "max": int(match.group(2).replace(",", "")),
+        "period": "year",
+        "text": raw,
+        "locale": "US",
+        "location_id": None,
+    }
+
+
+def build_job_detail_v1_from_html(html_text, job_id=None, fallback_job=None):
+    soup = BeautifulSoup(html_text or "", "html.parser")
+    main = (
+        soup.find("main", class_="main")
+        or soup.find("main")
+        or soup.select_one("div.singlejob_container__T16Px")
+        or soup.select_one("div.container.block-container")
+        or soup
+    )
+    lines = _clean_lines(main)
+    header = {**_extract_header_values(lines), **_extract_header_from_dom(main)}
+    fallback_job = fallback_job or {}
+    sections = _extract_structured_sections(main)
+    full_text = build_full_text(
+        _extract_description_text(main),
+        *(section.get("text") for section in sections),
+        *(section.get("items") for section in sections),
+    )
+
+    return make_job_detail(
+        job_id=job_id or fallback_job.get("id"),
+        title=header.get("title") or fallback_job.get("jobTitle"),
+        company="Spotify",
+        metadata={
+            "department": header.get("department") or fallback_job.get("team"),
+            "job_family": header.get("job_family") or fallback_job.get("department"),
+            "role_type": header.get("role_type"),
+            "job_type": header.get("job_type") or fallback_job.get("contract"),
+            "locations": header.get("locations") or fallback_job.get("location"),
+        },
+        full_text=full_text,
+        sections=sections,
+        compensation=_extract_compensation(full_text),
+    )
 
 
 def process_jobs(job_data, job_data_keys):
@@ -248,8 +473,8 @@ def update_master_list_with_jobs(jobs, master_list):
                     request_type=REQUEST_TYPE_SINGLE
                 )
                 if response:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    job_text = soup.find('main', class_='main').get_text()
+                    job_detail = build_job_detail_v1_from_html(response.text, job_id=job_id, fallback_job=job)
+                    job_text = json.dumps(job_detail, ensure_ascii=False)
                     upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
 
     # Mark old jobs as inactive
