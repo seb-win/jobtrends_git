@@ -7,6 +7,7 @@ import html
 import re
 
 from orchestrator.schemas.job_detail_v1 import build_full_text, clean_text, make_job_detail, make_section, map_section_name
+from orchestrator.schemas.section_extraction import make_extracted_section
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -118,7 +119,7 @@ def _html_to_sections(html_text):
     current = {"name": "description", "heading": None, "text_parts": [], "items": []}
 
     def flush_current():
-        section = make_section(
+        section = make_extracted_section(
             current["name"],
             heading=current["heading"],
             text=build_full_text(*current["text_parts"]),

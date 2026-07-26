@@ -11,6 +11,7 @@ from orchestrator.schemas.job_detail_v1 import (
     make_section,
     map_section_name,
 )
+from orchestrator.schemas.section_extraction import make_extracted_section
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -131,7 +132,7 @@ def extract_workday_sections(job_description_html):
         if not current:
             return
 
-        section = make_section(
+        section = make_extracted_section(
             current["name"],
             heading=current["heading"],
             text=build_full_text(*current["text_parts"]),

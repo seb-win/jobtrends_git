@@ -14,6 +14,7 @@ from orchestrator.schemas.job_detail_v1 import (
     make_job_detail,
     make_section,
 )
+from orchestrator.schemas.section_extraction import make_extracted_section
 
 # --------------------------------------
 # Configuration and Constants
@@ -355,8 +356,8 @@ def build_job_detail_v1_from_json(raw_job):
         full_text=full_text,
         sections=[
             make_section("description", heading="Description", text=description),
-            make_section("basic_qualifications", heading="Basic qualifications", text=basic_qualifications),
-            make_section("preferred_qualifications", heading="Preferred qualifications", text=preferred_qualifications),
+            make_extracted_section("basic_qualifications", heading="Basic qualifications", text=basic_qualifications),
+            make_extracted_section("preferred_qualifications", heading="Preferred qualifications", text=preferred_qualifications),
         ],
         compensation=extract_amazon_compensation(preferred_qualifications, description),
     )

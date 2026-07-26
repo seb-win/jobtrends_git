@@ -4,6 +4,7 @@ import re
 import time
 import psutil
 from bs4 import BeautifulSoup
+from orchestrator.schemas.section_extraction import looks_like_compliance_or_benefits_text, map_extracted_section_name
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -147,6 +148,101 @@ def add_section(sections, name, heading, text=None, items=None):
         })
 
 
+def oracle_section_name_for_heading(heading, default='responsibilities'):
+    normalized = (clean_plain_text(heading) or '').casefold().rstrip(':')
+    if normalized == 'experience':
+        return 'qualifications'
+    if 'responsibilit' in normalized or normalized in {'core responsibilities', 'key responsibilities'}:
+        return 'responsibilities'
+    if 'about the team' in normalized or normalized == 'who are we looking for?':
+        return 'about'
+    return map_extracted_section_name(heading, default=default)
+
+
+def extract_oracle_sections_from_html(value, default_name, default_heading):
+    if not value:
+        return []
+
+    soup = BeautifulSoup(value, 'html.parser')
+    sections = []
+    current = {
+        'name': default_name,
+        'heading': default_heading,
+        'text_parts': [],
+        'items': [],
+    }
+
+    def flush_current():
+        nonlocal current
+        text = '\n\n'.join(part for part in current['text_parts'] if part) or None
+        add_section(sections, current['name'], current['heading'], text, current['items'])
+        current = None
+
+    def start_section(heading, remaining=None):
+        nonlocal current
+        if current:
+            flush_current()
+        current = {
+            'name': oracle_section_name_for_heading(heading, default_name),
+            'heading': clean_plain_text(heading),
+            'text_parts': [remaining] if remaining else [],
+            'items': [],
+        }
+
+    for element in soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'ul', 'li'], recursive=True):
+        if element.find_parent('li'):
+            continue
+        if element.name == 'p' and element.find(['p', 'ul']):
+            continue
+
+        if element.name == 'li':
+            if element.find_parent('ul'):
+                continue
+            item = clean_plain_text(element.get_text(' '))
+            if item and current:
+                current['items'].append(item)
+            continue
+
+        if element.name == 'ul':
+            items = [
+                clean_plain_text(li.get_text(' '))
+                for li in element.find_all('li', recursive=False)
+            ]
+            items = [item for item in items if item]
+            if current:
+                current['items'].extend(items)
+            continue
+
+        text = clean_plain_text(element.get_text(' '))
+        if not text:
+            continue
+
+        heading = None
+        if element.name in {'h1', 'h2', 'h3', 'h4'}:
+            heading = text
+        else:
+            bold = element.find(['strong', 'b'])
+            bold_text = clean_plain_text(bold.get_text(' ')) if bold else None
+            if bold_text and (text == bold_text or text.startswith(bold_text)):
+                heading = bold_text
+            elif len(text) <= 80 and text.rstrip().endswith(':'):
+                candidate = text.rstrip(':')
+                mapped_name = oracle_section_name_for_heading(candidate, default=None)
+                if mapped_name or default_name != 'description':
+                    heading = text
+
+        if heading:
+            remaining = clean_plain_text(text[len(heading):]) if text.startswith(heading) else None
+            start_section(heading.rstrip(':'), remaining)
+        elif current:
+            current['text_parts'].append(text)
+
+    if current:
+        flush_current()
+
+    return [section for section in sections if section]
+
+
 def parse_compensation(job):
     qualifications_text = clean_html_text(job.get('ExternalQualificationsStr'))
     if not qualifications_text:
@@ -207,18 +303,19 @@ def build_job_detail_v1_from_json(detail_data):
     full_text = '\n\n'.join(part for part in full_text_parts if part) or None
 
     sections = []
-    add_section(sections, 'description', 'Description', job.get('ExternalDescriptionStr'))
+    sections.extend(extract_oracle_sections_from_html(job.get('ExternalDescriptionStr'), 'description', 'Description'))
+    sections.extend(extract_oracle_sections_from_html(job.get('ExternalResponsibilitiesStr'), 'responsibilities', 'Responsibilities'))
+
+    qualifications_name = 'qualifications'
+    qualifications_heading = 'Qualifications'
+    if looks_like_compliance_or_benefits_text(job.get('ExternalQualificationsStr')):
+        qualifications_name = 'additional_information'
+        qualifications_heading = 'Oracle qualifications field / compliance information'
+
     add_section(
         sections,
-        'responsibilities',
-        'Responsibilities',
-        job.get('ExternalResponsibilitiesStr'),
-        html_list_items(job.get('ExternalResponsibilitiesStr')),
-    )
-    add_section(
-        sections,
-        'qualifications',
-        'Qualifications',
+        qualifications_name,
+        qualifications_heading,
         job.get('ExternalQualificationsStr'),
         html_list_items(job.get('ExternalQualificationsStr')),
     )

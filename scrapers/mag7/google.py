@@ -188,10 +188,18 @@ def build_job_detail_v1_from_html(html_text, job_id=None):
         full_text_parts.append(about_section["text"])
 
     resp_el = root.select_one("div.BDNOWe")
+    resp_items = []
+    if resp_el:
+        resp_items = [
+            _element_text(li)
+            for li in resp_el.select("li")
+            if _element_text(li)
+        ]
     responsibilities_section = _section(
         "responsibilities",
         "Responsibilities",
         text=resp_el.get_text("\n", strip=True) if resp_el else None,
+        items=resp_items,
     )
     if responsibilities_section:
         sections.append(responsibilities_section)
