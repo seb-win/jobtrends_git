@@ -25,4 +25,10 @@
 }, {
     "name": "blackforest_scraper",
     "path": "scrapers/ai/blackforest.py"
+}, {
+    "name": "ode_scraper",
+    "path": "scrapers/ai/ode.py"
+}, {
+    "name": "deploy_scraper",
+    "path": "scrapers/ai/deploy.py"
 }]
