@@ -3,6 +3,7 @@ import time
 import psutil
 from bs4 import BeautifulSoup
 import json
+import re
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -89,6 +90,224 @@ JSON_PAYLOAD = {
     'query': 'query ApiJobBoardWithTeams($organizationHostedJobsPageName: String!) {\n  jobBoard: jobBoardWithTeams(\n    organizationHostedJobsPageName: $organizationHostedJobsPageName\n  ) {\n    teams {\n      id\n      name\n      parentTeamId\n      __typename\n    }\n    jobPostings {\n      id\n      title\n      teamId\n      locationId\n      locationName\n      workplaceType\n      employmentType\n      secondaryLocations {\n        ...JobPostingSecondaryLocationParts\n        __typename\n      }\n      compensationTierSummary\n      __typename\n    }\n    __typename\n  }\n}\n\nfragment JobPostingSecondaryLocationParts on JobPostingSecondaryLocation {\n  locationId\n  locationName\n  __typename\n}',
 }
 DATA = None
+
+
+def clean_text(value):
+    if value is None:
+        return None
+    text = BeautifulSoup(str(value), "html.parser").get_text(" ", strip=True)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or None
+
+
+def section_name_from_heading(heading):
+    normalized = re.sub(r"[^a-z0-9]+", " ", heading.lower()).strip()
+    if normalized in {"who are we", "about us", "about the team"}:
+        return "about"
+    if normalized in {"role overview", "why this role", "about the job", "job description", "description"}:
+        return "description"
+    if "responsibilit" in normalized or normalized.startswith("as a ") or "you will" in normalized:
+        return "responsibilities"
+    if (
+        "qualification" in normalized
+        or "requirements" in normalized
+        or "good fit" in normalized
+        or "you have" in normalized
+    ):
+        return "qualifications"
+    if "benefit" in normalized or "perk" in normalized:
+        return "benefits"
+    if "compensation" in normalized or "salary" in normalized:
+        return "compensation"
+    if "equal opportunity" in normalized or "diversity" in normalized:
+        return "equal_opportunity"
+    if "candidate journey" in normalized or "how and where we work" in normalized:
+        return "additional_information"
+    return "other"
+
+
+def extract_sections_from_html(description_html):
+    if not description_html:
+        return []
+
+    soup = BeautifulSoup(description_html, "html.parser")
+    sections = []
+    current = None
+
+    def flush_current():
+        nonlocal current
+        if not current:
+            return
+        text = clean_text(" ".join(current.pop("_text_parts", [])))
+        if text or current["items"]:
+            current["text"] = text
+            sections.append(current)
+        current = None
+
+    def start_section(heading):
+        nonlocal current
+        flush_current()
+        current = {
+            "name": section_name_from_heading(heading),
+            "heading": heading,
+            "text": None,
+            "items": [],
+            "_text_parts": [],
+        }
+
+    for element in soup.find_all(["p", "h1", "h2", "h3", "li"], recursive=True):
+        if element.find_parent("li") and element.name != "li":
+            continue
+
+        text = clean_text(element)
+        if not text:
+            continue
+
+        is_heading = element.name in {"h1", "h2", "h3"} or (
+            element.name == "p"
+            and element.find(["strong", "b"])
+            and clean_text(element.find(["strong", "b"])) == text
+            and len(text) <= 120
+        )
+
+        if is_heading:
+            start_section(text.rstrip(":"))
+            continue
+
+        if current is None:
+            current = {
+                "name": "description",
+                "heading": None,
+                "text": None,
+                "items": [],
+                "_text_parts": [],
+            }
+
+        if element.name == "li":
+            current["items"].append(text)
+        else:
+            current["_text_parts"].append(text)
+
+    flush_current()
+    return sections
+
+
+def extract_compensation_from_text(full_text):
+    if not full_text:
+        return {
+            "raw": None,
+            "currency": None,
+            "min": None,
+            "max": None,
+            "period": None,
+            "text": None,
+            "locale": None,
+            "location_id": None,
+        }
+
+    range_match = re.search(
+        r"((?:USD|CAD|\$)\s*)?([\$]?\d[\d,]*(?:\.\d+)?)\s*(?:-|to|\u2013|\u2014)\s*((?:USD|CAD|\$)\s*)?([\$]?\d[\d,]*(?:\.\d+)?)(?:\s*\[(USD|CAD)\])?",
+        full_text,
+        re.IGNORECASE,
+    )
+    hourly_match = re.search(
+        r"([\$]?\d[\d,]*(?:\.\d+)?)\s*(USD|CAD|\$)?\s*/\s*hour|([\$]?\d[\d,]*(?:\.\d+)?)\s*(USD|CAD|\$)\s+per\s+hour",
+        full_text,
+        re.IGNORECASE,
+    )
+
+    if range_match:
+        currency = range_match.group(5) or range_match.group(1) or range_match.group(3)
+        minimum = range_match.group(2)
+        maximum = range_match.group(4)
+        raw = range_match.group(0)
+        return {
+            "raw": raw,
+            "currency": clean_text(currency).replace("$", "USD") if currency else None,
+            "min": float(minimum.replace("$", "").replace(",", "")),
+            "max": float(maximum.replace("$", "").replace(",", "")),
+            "period": None,
+            "text": raw,
+            "locale": None,
+            "location_id": None,
+        }
+
+    if hourly_match:
+        amount = hourly_match.group(1) or hourly_match.group(3)
+        currency = hourly_match.group(2) or hourly_match.group(4)
+        raw = hourly_match.group(0)
+        return {
+            "raw": raw,
+            "currency": clean_text(currency).replace("$", "USD") if currency else None,
+            "min": float(amount.replace("$", "").replace(",", "")),
+            "max": float(amount.replace("$", "").replace(",", "")),
+            "period": "hour",
+            "text": raw,
+            "locale": None,
+            "location_id": None,
+        }
+
+    return {
+        "raw": None,
+        "currency": None,
+        "min": None,
+        "max": None,
+        "period": None,
+        "text": None,
+        "locale": None,
+        "location_id": None,
+    }
+
+
+def build_job_detail_v1_from_json(detail_json):
+    posting = get_nested_value(detail_json, ["data", "jobPosting"]) or {}
+    description_html = posting.get("descriptionHtml")
+    full_text = clean_text(description_html)
+    team_names = posting.get("teamNames") or []
+    locations = []
+    for location in [posting.get("locationName")] + (posting.get("secondaryLocationNames") or []):
+        if location and location not in locations:
+            locations.append(location)
+
+    compensation_text = clean_text(posting.get("scrapeableCompensationSalarySummary"))
+    compensation_raw = (
+        posting.get("scrapeableCompensationSalarySummary")
+        or posting.get("compensationTierSummary")
+        or None
+    )
+    compensation = extract_compensation_from_text(full_text)
+    if compensation_raw:
+        compensation["raw"] = compensation_raw
+        compensation["text"] = compensation_text
+
+    return {
+        "schema_version": "job_detail_v1",
+        "job": {
+            "id": posting.get("id"),
+            "title": posting.get("title"),
+            "company": "Cohere",
+        },
+        "metadata": {
+            "department": team_names[-1] if len(team_names) > 1 else posting.get("departmentName"),
+            "job_family": team_names[0] if len(team_names) > 1 else None,
+            "role_type": None,
+            "employment_type": posting.get("employmentType"),
+            "job_type": posting.get("workplaceType"),
+            "career_level": None,
+            "experience_level": None,
+            "required_travel": None,
+            "locations": locations,
+            "created_at": None,
+            "posted_at": None,
+            "updated_at": None,
+        },
+        "content": {
+            "full_text": full_text,
+            "full_text_truncated": False,
+            "sections": extract_sections_from_html(description_html),
+        },
+        "compensation": compensation,
+    }
 
 
 def process_jobs(job_data, job_data_keys, team_list):
@@ -284,8 +503,8 @@ def update_master_list_with_jobs(jobs, master_list):
                 )
                 if response:
                     json_text = json.loads(response.text)
-                    job_text = json_text['data']['jobPosting']['descriptionHtml']
-                    upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
+                    job_detail = build_job_detail_v1_from_json(json_text)
+                    upload_job_details_to_gcs(json.dumps(job_detail, ensure_ascii=False), job_id, BUCKET_NAME, FOLDER_NAME)
 
     # Mark old jobs as inactive
     for entry in master_list:
