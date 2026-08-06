@@ -27,8 +27,8 @@ FOLDER_NAME = 'ode'
 USE_PROXY_DAILY_LIST = False
 USE_PROXY_DETAILED_POSTINGS = False
 USE_PAGINATION = False
-REQUEST_TYPE_LIST = 'get'
-REQUEST_TYPE_SINGLE = 'get'
+REQUEST_TYPE_LIST = 'post'
+REQUEST_TYPE_SINGLE = 'post'
 
 MAX_JOBS_PER_PAGE = 50
 PAGE_START = 1
@@ -94,6 +94,33 @@ JSON_PAYLOAD = {
     'query': 'query ApiJobBoardWithTeams($organizationHostedJobsPageName: String!) {\n  jobBoard: jobBoardWithTeams(\n    organizationHostedJobsPageName: $organizationHostedJobsPageName\n  ) {\n    teams {\n      id\n      name\n      externalName\n      parentTeamId\n      __typename\n    }\n    jobPostings {\n      id\n      title\n      teamId\n      locationId\n      locationName\n      workplaceType\n      employmentType\n      secondaryLocations {\n        ...JobPostingSecondaryLocationParts\n        __typename\n      }\n      compensationTierSummary\n      __typename\n    }\n    __typename\n  }\n}\n\nfragment JobPostingSecondaryLocationParts on JobPostingSecondaryLocation {\n  locationId\n  locationName\n  __typename\n}',
 }
 DATA = None
+
+
+JOB_DETAIL_QUERY = '''
+query ApiJobPosting($organizationHostedJobsPageName: String!, $jobPostingId: String!) {
+  jobPosting(
+    organizationHostedJobsPageName: $organizationHostedJobsPageName
+    jobPostingId: $jobPostingId
+  ) {
+    id
+    title
+    departmentName
+    departmentExternalName
+    locationName
+    workplaceType
+    employmentType
+    descriptionHtml
+    teamNames
+    secondaryLocationNames
+    compensationTierSummary
+    scrapeableCompensationSalarySummary
+    compensationPhilosophyHtml
+    applicationLimitCalloutHtml
+    applicationDeadline
+    __typename
+  }
+}
+'''
 
 
 class _SectionHTMLParser(HTMLParser):
@@ -467,22 +494,34 @@ def update_master_list_with_jobs(jobs, master_list):
             master_list.append(job)
             new_jobs_count += 1
 
-            # Fetch job details if a link is provided
-            job_link = job.get('link')
-            if job_link:
-                response = fetch_url(
-                    job_link,
-                    headers=HEADERS,
-                    params=PARAMS,
-                    json=JSON_PAYLOAD,
-                    data=DATA,
-                    use_proxy=USE_PROXY_DETAILED_POSTINGS,
-                    max_retries=3,
-                    timeout=10,
-                    request_type=REQUEST_TYPE_SINGLE
-                )
-                if response:
+            job_link = 'https://jobs.ashbyhq.com/api/non-user-graphql?op=ApiJobPosting'
+            params = {'op': 'ApiJobPosting'}
+            json_data = {
+                'operationName': 'ApiJobPosting',
+                'variables': {
+                    'organizationHostedJobsPageName': 'odewithanthropic',
+                    'jobPostingId': job_id,
+                },
+                'query': JOB_DETAIL_QUERY,
+            }
+
+            response = fetch_url(
+                job_link,
+                headers=HEADERS,
+                params=params,
+                json=json_data,
+                data=DATA,
+                use_proxy=USE_PROXY_DETAILED_POSTINGS,
+                max_retries=3,
+                timeout=10,
+                request_type=REQUEST_TYPE_SINGLE
+            )
+            if response:
+                try:
                     detail_json = response.json()
+                except ValueError as e:
+                    logging.error(f"Failed to parse job detail JSON for {job_id}: {e}")
+                else:
                     job_detail = build_job_detail_json(detail_json)
                     upload_job_details_to_gcs(job_detail, job_id, BUCKET_NAME, FOLDER_NAME)
 
