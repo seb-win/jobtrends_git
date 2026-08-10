@@ -1,7 +1,10 @@
+import json
 import logging
+import re
 import time
 import psutil
 from bs4 import BeautifulSoup
+from orchestrator.schemas.job_detail_v1 import clean_text, make_job_detail, make_section
 from orchestrator.util_v2 import (
     get_proxy, fetch_url, load_master_list, save_master_list,
     get_current_date, get_storage_client, update_job_status,
@@ -60,11 +63,7 @@ JOB_DATA_KEYS = {
     'id': ['data', 'req_id'],
     'link': [],
     'career_level': [],
-    'employment_type': ['data', 'employment_type'],
-    'description': ['data', 'description'],
-    'company': ['data', 'hiring_organization'],
-    'qualifications': ['data','qualifications'],
-    'responsibilities': ['data', 'responsibilities']
+    'employment_type': ['data', 'employment_type']
 }
 
 extraction_logic = {
@@ -80,6 +79,115 @@ PARAMS = {
 }
 JSON_PAYLOAD = None
 DATA = None
+
+
+def _detail_data(raw_job):
+    if isinstance(raw_job, dict) and isinstance(raw_job.get('data'), dict):
+        return raw_job['data']
+    return raw_job if isinstance(raw_job, dict) else {}
+
+
+def _first_list_value(value):
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
+
+
+def _category_name(data):
+    categories = data.get('categories')
+    if isinstance(categories, list) and categories:
+        first_category = categories[0]
+        if isinstance(first_category, dict):
+            return first_category.get('name')
+        return first_category
+
+    category = data.get('category')
+    return _first_list_value(category)
+
+
+def _location_values(data):
+    values = []
+    for key in ('full_location', 'short_location', 'location_name'):
+        value = clean_text(data.get(key))
+        if value and value not in values:
+            values.append(value)
+
+    if not values:
+        parts = [data.get('city'), data.get('state'), data.get('country')]
+        value = clean_text(', '.join(part for part in parts if part))
+        if value:
+            values.append(value)
+
+    return values
+
+
+def _extract_compensation(description):
+    text = clean_text(description)
+    if not text:
+        return {}
+
+    pay_match = re.search(
+        r'expected pay range is\s+([A-Z]{3})\s+\$?([0-9][0-9,]*(?:\.[0-9]+)?)\s*-\s*\$?([0-9][0-9,]*(?:\.[0-9]+)?)\s+per\s+([A-Za-z]+)',
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not pay_match:
+        return {}
+
+    currency, min_value, max_value, period = pay_match.groups()
+    raw = pay_match.group(0)
+    return {
+        'raw': raw,
+        'currency': currency.upper(),
+        'min': float(min_value.replace(',', '')),
+        'max': float(max_value.replace(',', '')),
+        'period': period.lower(),
+        'text': raw,
+        'locale': None,
+        'location_id': None,
+    }
+
+
+def build_job_detail_v1_from_json(raw_job):
+    data = _detail_data(raw_job)
+    description = data.get('description')
+    responsibilities = data.get('responsibilities')
+    qualifications = data.get('qualifications')
+
+    sections = [
+        make_section('responsibilities', heading='Responsibilities', text=responsibilities),
+        make_section('qualifications', heading='Qualifications', text=qualifications),
+    ]
+
+    return make_job_detail(
+        job_id=data.get('req_id') or data.get('slug'),
+        title=data.get('title'),
+        company=data.get('hiring_organization') or 'Schneider Electric',
+        metadata={
+            'department': None,
+            'job_family': _category_name(data),
+            'role_type': _first_list_value(data.get('tags1')),
+            'employment_type': data.get('employment_type') or _first_list_value(data.get('tags3')),
+            'job_type': _first_list_value(data.get('tags7')),
+            'career_level': _first_list_value(data.get('tags2')),
+            'locations': _location_values(data),
+            'created_at': data.get('create_date'),
+            'posted_at': data.get('posted_date'),
+            'updated_at': data.get('update_date'),
+        },
+        full_text=description,
+        sections=sections,
+        compensation=_extract_compensation(description),
+    )
+
+
+def build_job_detail_json(raw_job):
+    return json.dumps(build_job_detail_v1_from_json(raw_job), ensure_ascii=False, indent=2)
+
+
+def _strip_internal_fields(job):
+    job.pop('_raw_listing', None)
+    return job
 
 
 def process_jobs(job_data, job_data_keys):
@@ -230,35 +338,21 @@ def update_master_list_with_jobs(jobs, master_list):
             continue
 
         existing_entry = next((entry for entry in master_list if entry['id'] == job_id), None)
+        raw_listing = job.get('_raw_listing') or job
 
         if existing_entry:
             update_job_status(existing_entry, current_date)
         else:
             # Add new job
+            _strip_internal_fields(job)
             job['scraping_date'] = current_date
             job['last_updated'] = current_date
             job['status'] = 'active'
             master_list.append(job)
             new_jobs_count += 1
 
-            # Fetch job details if a link is provided
-            # job_link = job.get('link')
-            # if job_link:
-            #     response = fetch_url(
-            #         job_link,
-            #         headers=HEADERS,
-            #         params=PARAMS,
-            #         json=JSON_PAYLOAD,
-            #         data=DATA,
-            #         use_proxy=USE_PROXY_DETAILED_POSTINGS,
-            #         max_retries=3,
-            #         timeout=10,
-            #         request_type=REQUEST_TYPE_SINGLE
-            #     )
-            #     if response:
-            #         soup = BeautifulSoup(response.text, 'html.parser')
-            #         job_text = soup.get_text()
-            #         upload_job_details_to_gcs(job_text, job_id, BUCKET_NAME, FOLDER_NAME)
+        job_detail_json = build_job_detail_json(raw_listing)
+        upload_job_details_to_gcs(job_detail_json, job_id, BUCKET_NAME, FOLDER_NAME)
 
     # Mark old jobs as inactive
     for entry in master_list:
@@ -279,6 +373,15 @@ def main():
 
     # Step 2: Process jobs using JOB_DATA_KEYS
     jobs = process_jobs(raw_job_data, JOB_DATA_KEYS)
+    raw_jobs_by_id = {
+        get_nested_value(raw_job, ['data', 'req_id']): raw_job
+        for raw_job in raw_job_data
+        if get_nested_value(raw_job, ['data', 'req_id'])
+    }
+    for job in jobs:
+        raw_listing = raw_jobs_by_id.get(job.get('id'))
+        if raw_listing:
+            job['_raw_listing'] = raw_listing
 
     # Step 3: Update master list
     master_list = load_master_list(BUCKET_NAME, FOLDER_NAME)

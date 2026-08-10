@@ -82,6 +82,118 @@ def clean_text(value):
     return text or None
 
 
+SECTION_NAME_BY_HEADING = {
+    "about the role": "description",
+    "what you'll be doing": "responsibilities",
+    "what you’ll be doing": "responsibilities",
+    "what skills and experience you'll bring": "qualifications",
+    "what skills and experience you’ll bring": "qualifications",
+    "what's on offer": "benefits",
+    "what’s on offer": "benefits",
+    "who we are": "about",
+    "how we work": "about",
+    "ihre aufgaben und verantwortlichkeiten": "responsibilities",
+    "ihre qualifikationen und erfahrung": "qualifications",
+    "ihr profil und ihre fähigkeiten": "requirements",
+    "unser globales team": "about",
+    "unsere kultur": "about",
+}
+
+
+def extract_detail_fields(soup):
+    fields = {}
+    for field in soup.select("#section0__content .article__content__view__field"):
+        label_element = field.select_one(".article__content__view__field__label")
+        value_element = field.select_one(".article__content__view__field__value")
+        label = clean_text(label_element.get_text(" ", strip=True)) if label_element else None
+        if label and value_element:
+            fields[label.rstrip(":")] = clean_text(value_element.get_text(" ", strip=True))
+    return fields
+
+
+def extract_job_title(soup):
+    title_element = soup.select_one(".section__header__text__title")
+    return clean_text(title_element.get_text(" ", strip=True)) if title_element else None
+
+
+def extract_detail_sections(detail_element):
+    if not detail_element:
+        return []
+
+    sections = []
+    current = None
+
+    for element in detail_element.find_all(["strong", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol"], recursive=True):
+        heading = clean_text(element.get_text(" ", strip=True))
+        if element.name in {"strong", "h1", "h2", "h3", "h4", "h5", "h6"}:
+            if not heading:
+                continue
+            key = heading.rstrip(":").lower()
+            section_name = SECTION_NAME_BY_HEADING.get(key)
+            if section_name:
+                current = {"name": section_name, "heading": heading.rstrip(":"), "text": None, "items": []}
+                sections.append(current)
+            continue
+
+        if element.name in {"ul", "ol"} and current:
+            items = [clean_text(item.get_text(" ", strip=True)) for item in element.find_all("li", recursive=False)]
+            current["items"].extend([item for item in items if item])
+
+    return [section for section in sections if section["text"] or section["items"]]
+
+
+def split_locations(value):
+    if not value:
+        return []
+    locations = [clean_text(part) for part in re.split(r"\s*;\s*", value)]
+    return [location for location in locations if location]
+
+
+def build_job_detail_v1_from_html(html_content):
+    soup = BeautifulSoup(html_content or "", "html.parser")
+    fields = extract_detail_fields(soup)
+    detail_element = soup.select_one("#section1__content")
+    full_text = clean_text(detail_element.get_text(" ", strip=True)) if detail_element else None
+
+    return {
+        "schema_version": "job_detail_v1",
+        "job": {
+            "id": fields.get("Job ID"),
+            "title": extract_job_title(soup),
+            "company": fields.get("Unternehmen") or "Siemens",
+        },
+        "metadata": {
+            "department": fields.get("Organization"),
+            "job_family": fields.get("Tätigkeitsbereich"),
+            "role_type": None,
+            "employment_type": fields.get("Beschäftigungsart"),
+            "job_type": fields.get("Arbeitsmodell"),
+            "career_level": fields.get("Erfahrungsniveau"),
+            "experience_level": None,
+            "required_travel": None,
+            "locations": split_locations(fields.get("Standort(e)")),
+            "created_at": None,
+            "posted_at": fields.get("Veröffentlicht seit"),
+            "updated_at": None,
+        },
+        "content": {
+            "full_text": full_text,
+            "full_text_truncated": False,
+            "sections": extract_detail_sections(detail_element),
+        },
+        "compensation": {
+            "raw": None,
+            "currency": None,
+            "min": None,
+            "max": None,
+            "period": None,
+            "text": None,
+            "locale": None,
+            "location_id": None,
+        },
+    }
+
+
 def process_jobs(job_postings):
     """
     Extract relevant job details from HTML job postings using BeautifulSoup.
@@ -265,14 +377,7 @@ def update_master_list_with_jobs(jobs, master_list):
                     request_type=REQUEST_TYPE_SINGLE
                 )
                 if response:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    short_details_element = soup.select_one("#section0__content")
-                    detail_text_element = soup.select_one("#section1__content")
-
-                    job_detail_data = {
-                        "short_details": short_details_element.get_text(separator=" ", strip=True) if short_details_element else None,
-                        "detail_text": detail_text_element.get_text(separator=" ", strip=True) if detail_text_element else None
-                    }
+                    job_detail_data = build_job_detail_v1_from_html(response.text)
                     job_detail_json = json.dumps(job_detail_data, ensure_ascii=False, indent=2)
                     upload_job_details_to_gcs(job_detail_json, job_id, BUCKET_NAME, FOLDER_NAME)
 
